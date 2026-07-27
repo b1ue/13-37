@@ -3,6 +3,9 @@
 #include <LV_Helper.h>
 #include <bosch/BoschSensorDataHelper.hpp>
 #include "esp_wifi.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+#include <WiFi.h>
 #include <time.h>
 #include <math.h>
 #include "gps_screen.h"
@@ -31,10 +34,12 @@
 #include "wifi_screen.h"
 #include "wifi_radio_screen.h"
 #include "bluetooth_screen.h"
+#include "stock_screen.h"
 #include "analyze_screen.h"
 #include "bt_analyze_screen.h"
 #include "lora_analyze_screen.h"
 #include "pingsweep.h"
+#include "hostresolve.h"
 #include "portscan.h"
 #include "portscan_screen.h"
 #include "wardriver_screen.h"
@@ -51,6 +56,9 @@
 #include "skimmer.h"
 #include "evil_twin.h"
 #include "flock.h"
+#include "mouse_hid.h"
+#include "ble_scan_manager.h"
+#include "wifi_beacon_manager.h"
 #include "matrix_bg.h"
 #include "nfc_icon.h"
 
@@ -822,8 +830,17 @@ void clock_screen_set_matrix(bool enabled)
 // Dim timer state — updated by settings screen callbacks
 static uint32_t s_dim_timeout_ms   = 0;   // 0 = disabled
 static uint8_t  s_dim_brightness   = DEVICE_MAX_BRIGHTNESS_LEVEL / 4;
+static uint8_t  s_active_brightness = DEVICE_MAX_BRIGHTNESS_LEVEL;
+static uint32_t s_sleep_timeout_ms  = 30UL * 60UL * 1000UL; // idle deep-sleep default
 static uint32_t s_last_activity_ms = 0;
 static bool     s_is_dimmed        = false;
+
+void clock_screen_set_brightness(uint8_t level)
+{
+    if (level < 1) level = 1;
+    s_active_brightness = level;
+    if (!s_is_dimmed) instance.setBrightness(s_active_brightness);
+}
 
 void clock_screen_set_dim_timeout(uint32_t ms)
 {
@@ -832,7 +849,7 @@ void clock_screen_set_dim_timeout(uint32_t ms)
     s_last_activity_ms = millis();
     if (s_is_dimmed) {
         s_is_dimmed = false;
-        instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
+        instance.setBrightness(s_active_brightness);
     }
 }
 
@@ -848,8 +865,14 @@ static void dim_reset_activity()
     s_last_activity_ms = millis();
     if (s_is_dimmed) {
         s_is_dimmed = false;
-        instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
+        instance.setBrightness(s_active_brightness);
     }
+}
+
+void clock_screen_set_sleep_timeout(uint32_t ms)
+{
+    s_sleep_timeout_ms = ms;
+    s_last_activity_ms = millis();
 }
 
 // ---- Motion-wake ----------------------------------------------------------
@@ -861,7 +884,7 @@ static void dim_reset_activity()
 // settings can switch it off if the user wants the dim timer to run even
 // while the watch is being worn.
 static SensorXYZ s_motion_accel(SensorBHI260AP::ACCEL_PASSTHROUGH, instance.sensor);
-static bool      s_motion_wake_enabled    = true;
+static bool      s_motion_wake_enabled    = false;
 static bool      s_motion_accel_started   = false;
 static float     s_motion_last_mag        = 0.0f;
 // 10 Hz is enough to catch a wrist tilt without burning power; the BHI260
@@ -914,6 +937,53 @@ static void motion_wake_poll()
     if (delta >= MOTION_DELTA_G) {
         dim_reset_activity();
     }
+}
+
+static bool idle_deep_sleep_allowed()
+{
+    // Auto deep-sleep only from the idle watch face. Other screens imply the
+    // user is actively doing something even if their worker is momentarily idle.
+    if (lv_screen_active() != clock_screen) return false;
+
+    // Keep the main loop alive for timepieces that must fire alerts.
+    if (alarm_is_enabled() || alarm_is_ringing()) return false;
+    if (timer_is_running() || stopwatch_is_running()) return false;
+
+    if (gps_screen_is_powered()) return false;
+    if (lora_screen_is_powered() || pager_is_running() || tpms_is_running() ||
+        aprs_is_running() || lora_analyze_is_running()) return false;
+    if (wifi_radio_screen_is_powered() || WiFi.status() == WL_CONNECTED ||
+        pingsweep_is_running() || portscan_is_running() ||
+        hostresolve_is_running() || wifi_beacon_active()) return false;
+    if (bluetooth_screen_is_powered() || ble_scan_active() ||
+        airtag_is_running() || flipper_is_running() || skimmer_is_running() ||
+        mouse_hid_is_running()) return false;
+    if (wardriver_is_running() || evil_twin_is_running() || flock_is_running())
+        return false;
+    if (usb_sd_is_running()) return false;
+
+    return true;
+}
+
+static void enter_idle_deep_sleep()
+{
+    matrix_bg_set_paused(true);
+    instance.setBrightness(0);
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+
+    instance.powerControl(POWER_NFC, false);
+    instance.powerControl(POWER_GPS, false);
+    instance.powerControl(POWER_RADIO, false);
+    instance.powerControl(POWER_SPEAK, false);
+
+    // Wake on BOOT (GPIO0) or the PMU interrupt used by the power button
+    // (GPIO7). Both are RTC-capable on ESP32-S3.
+    esp_sleep_enable_ext1_wakeup((1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_7),
+                                 ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
 }
 
 // Called by gps_screen after a quality fix to set the longitude-derived UTC offset
@@ -1547,6 +1617,7 @@ void setup()
     wifi_screen_create();
     wifi_radio_screen_create();
     bluetooth_screen_create();
+    stock_screen_create();
     portscan_screen_create();
     analyze_screen_create();
     bt_analyze_screen_create();
@@ -1623,12 +1694,10 @@ void setup()
     update_wardriver_indicator();
     instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
 
-    // Bring the motion-wake accelerometer up to its default state before
-    // loading settings — settings_screen_load() will flip it off again if
-    // the user has it disabled in /Settings/settings.txt. Doing this here
-    // (rather than at the static-init / declaration site) means it happens
-    // after instance.begin() has finished bringing the BHI260 firmware up.
-    clock_screen_set_motion_wake(true);
+    // Motion-wake is convenient, but it can repeatedly brighten a worn watch
+    // while the user is not actively using it. Leave it off unless the saved
+    // settings turn it on.
+    clock_screen_set_motion_wake(false);
 
     // Restore persisted settings from the SD card (if mounted and file exists).
     // Called after the default setBrightness so a saved brightness wins.
@@ -1672,6 +1741,8 @@ void loop()
                 bluetooth_screen_show();
             } else if (bluetooth_screen_is_active()) {
                 wifi_radio_screen_show();
+            } else if (stock_screen_is_active()) {
+                tools_screen_show();
             } else if (wifi_radio_screen_is_active()) {
                 lora_screen_show();
             } else if (lora_screen_is_active()) {
@@ -1798,6 +1869,11 @@ void loop()
             s_is_dimmed = true;
             instance.setBrightness(s_dim_brightness);
         }
+    }
+    if (s_sleep_timeout_ms > 0 &&
+        millis() - s_last_activity_ms >= s_sleep_timeout_ms &&
+        idle_deep_sleep_allowed()) {
+        enter_idle_deep_sleep();
     }
 
     // 1Hz block also skipped during LVGL priority window - it contains

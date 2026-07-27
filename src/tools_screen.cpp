@@ -11,6 +11,7 @@
 #include "usb_sd_screen.h"
 #include "aprs_screen.h"
 #include "wifi_screen.h"
+#include "stock_screen.h"
 #include "analyze_screen.h"
 #include <LilyGoLib.h>
 
@@ -872,6 +873,49 @@ static void draw_tesla_cp_icon(lv_obj_t *tile)
     lv_obj_align(led, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
 }
 
+static void draw_stock_icon(lv_obj_t *tile)
+{
+    lv_color_t green = lv_color_make(0x00, 0xCC, 0x66);
+    lv_color_t blue  = lv_color_make(0x33, 0xBB, 0xFF);
+    lv_color_t grid  = lv_color_make(0x44, 0x44, 0x44);
+
+    // Axes
+    lv_obj_t *x_axis = lv_obj_create(tile);
+    lv_obj_set_size(x_axis, 112, 2);
+    lv_obj_set_style_bg_color(x_axis, grid, LV_PART_MAIN);
+    lv_obj_set_style_border_width(x_axis, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(x_axis, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(x_axis, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(x_axis, LV_ALIGN_TOP_MID, 0, 112);
+
+    lv_obj_t *y_axis = lv_obj_create(tile);
+    lv_obj_set_size(y_axis, 2, 82);
+    lv_obj_set_style_bg_color(y_axis, grid, LV_PART_MAIN);
+    lv_obj_set_style_border_width(y_axis, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(y_axis, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(y_axis, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(y_axis, LV_ALIGN_TOP_MID, -56, 32);
+
+    // Rising bars.
+    static const int heights[5] = { 24, 42, 34, 62, 78 };
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *bar = lv_obj_create(tile);
+        lv_obj_set_size(bar, 14, heights[i]);
+        lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar, i == 4 ? green : blue, LV_PART_MAIN);
+        lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(bar, LV_ALIGN_TOP_MID, -36 + i * 18, 112 - heights[i]);
+    }
+
+    lv_obj_t *ticker = lv_label_create(tile);
+    lv_obj_set_style_text_color(ticker, green, LV_PART_MAIN);
+    lv_obj_set_style_text_font(ticker, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(ticker, "$");
+    lv_obj_align(ticker, LV_ALIGN_TOP_MID, 46, 28);
+}
+
 void tools_screen_create()
 {
     tools_screen = lv_obj_create(NULL);
@@ -910,9 +954,9 @@ void tools_screen_create()
     //   [Mouse]     [USB SD]
     //   [Pager]     [TPMS]
     //   [LoRa APRS] [Tesla CP]
-    //   [AirTag]    [Flipper]
-    //   [Skimmers]  [Evil Twin]
-    //   [Flock]
+    //   [Stocks]    [AirTag]
+    //   [Flipper]   [Skimmers]
+    //   [Evil Twin] [Flock]
     // The timepiece tiles (Alarm / Stopwatch / Timer / Calendar) used to live
     // at the bottom of this grid; they moved to the TIME screen (swipe up
     // from the clock face).
@@ -924,6 +968,7 @@ void tools_screen_create()
     lv_obj_t *t_tpms    = make_tile(grid, "TPMS");
     lv_obj_t *t_aprs    = make_tile(grid, "LoRa APRS");
     lv_obj_t *t_tesla   = make_tile(grid, "Tesla CP");
+    lv_obj_t *t_stocks  = make_tile(grid, "Stocks");
     t_airtag            = make_tile(grid, "AirTag");
     t_flipper           = make_tile(grid, "Flipper");
     t_skimmer           = make_tile(grid, "Skimmers");
@@ -938,6 +983,7 @@ void tools_screen_create()
     draw_tpms_icon(t_tpms);
     draw_aprs_icon(t_aprs);
     draw_tesla_cp_icon(t_tesla);
+    draw_stock_icon(t_stocks);
     draw_airtag_icon(t_airtag);
     draw_flipper_icon(t_flipper);
     draw_skimmer_icon(t_skimmer);
@@ -946,6 +992,9 @@ void tools_screen_create()
 
     // Tesla CP tile opens the 315 MHz charge-port-open transmit screen.
     lv_obj_add_event_cb(t_tesla, [](lv_event_t *) { tesla_cp_screen_show(); }, LV_EVENT_CLICKED, NULL);
+
+    // Stocks tile opens the ticker quote screen.
+    lv_obj_add_event_cb(t_stocks, [](lv_event_t *) { stock_screen_show(); }, LV_EVENT_CLICKED, NULL);
 
     // AirTag tile toggles the BLE Find My sniffer and swaps to a dim green
     // background while running.
