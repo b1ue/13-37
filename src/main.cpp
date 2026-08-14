@@ -3,8 +3,6 @@
 #include <LV_Helper.h>
 #include <bosch/BoschSensorDataHelper.hpp>
 #include "esp_wifi.h"
-#include "esp_sleep.h"
-#include "driver/gpio.h"
 #include <WiFi.h>
 #include <time.h>
 #include <math.h>
@@ -832,6 +830,10 @@ static uint32_t s_dim_timeout_ms   = 0;   // 0 = disabled
 static uint8_t  s_dim_brightness   = DEVICE_MAX_BRIGHTNESS_LEVEL / 4;
 static uint8_t  s_active_brightness = DEVICE_MAX_BRIGHTNESS_LEVEL;
 static uint32_t s_sleep_timeout_ms  = 30UL * 60UL * 1000UL; // idle deep-sleep default
+static bool     s_keep_awake_screen = true;
+static bool     s_keep_awake_wifi   = false;
+static bool     s_keep_awake_radios = true;
+static bool     s_keep_awake_tools  = true;
 static uint32_t s_last_activity_ms = 0;
 static bool     s_is_dimmed        = false;
 
@@ -874,6 +876,11 @@ void clock_screen_set_sleep_timeout(uint32_t ms)
     s_sleep_timeout_ms = ms;
     s_last_activity_ms = millis();
 }
+
+void clock_screen_set_keep_awake_screen(bool enabled) { s_keep_awake_screen = enabled; }
+void clock_screen_set_keep_awake_wifi(bool enabled)   { s_keep_awake_wifi = enabled; }
+void clock_screen_set_keep_awake_radios(bool enabled) { s_keep_awake_radios = enabled; }
+void clock_screen_set_keep_awake_tools(bool enabled)  { s_keep_awake_tools = enabled; }
 
 // ---- Motion-wake ----------------------------------------------------------
 //
@@ -941,25 +948,31 @@ static void motion_wake_poll()
 
 static bool idle_deep_sleep_allowed()
 {
-    // Auto deep-sleep only from the idle watch face. Other screens imply the
-    // user is actively doing something even if their worker is momentarily idle.
-    if (lv_screen_active() != clock_screen) return false;
-
-    // Keep the main loop alive for timepieces that must fire alerts.
+    // Alarms and timepieces are hard safety blockers: deep sleep would stop
+    // their software timers and cause the alert to be missed.
     if (alarm_is_enabled() || alarm_is_ringing()) return false;
     if (timer_is_running() || stopwatch_is_running()) return false;
 
-    if (gps_screen_is_powered()) return false;
-    if (lora_screen_is_powered() || pager_is_running() || tpms_is_running() ||
-        aprs_is_running() || lora_analyze_is_running()) return false;
-    if (wifi_radio_screen_is_powered() || WiFi.status() == WL_CONNECTED ||
-        pingsweep_is_running() || portscan_is_running() ||
-        hostresolve_is_running() || wifi_beacon_active()) return false;
-    if (bluetooth_screen_is_powered() || ble_scan_active() ||
-        airtag_is_running() || flipper_is_running() || skimmer_is_running() ||
-        mouse_hid_is_running()) return false;
-    if (wardriver_is_running() || evil_twin_is_running() || flock_is_running())
-        return false;
+    if (s_keep_awake_screen && lv_screen_active() != clock_screen) return false;
+
+    if (s_keep_awake_wifi &&
+        (wifi_radio_screen_is_powered() || WiFi.status() == WL_CONNECTED ||
+         pingsweep_is_running() || portscan_is_running() ||
+         hostresolve_is_running() || stock_screen_is_fetching())) return false;
+
+    if (s_keep_awake_radios &&
+        (gps_screen_is_powered() || nfc_screen_is_powered() ||
+         lora_screen_is_powered() || pager_is_running() || tpms_is_running() ||
+         aprs_is_running() || lora_analyze_is_running() || meshtastic_is_active() ||
+         bluetooth_screen_is_powered() || ble_scan_active() ||
+         mouse_hid_is_running())) return false;
+
+    if (s_keep_awake_tools &&
+        (wardriver_is_running() || evil_twin_is_running() || flock_is_running() ||
+         airtag_is_running() || flipper_is_running() || skimmer_is_running() ||
+         wifi_beacon_active())) return false;
+
+    // Never unmount storage from a host computer automatically.
     if (usb_sd_is_running()) return false;
 
     return true;
@@ -970,20 +983,19 @@ static void enter_idle_deep_sleep()
     matrix_bg_set_paused(true);
     instance.setBrightness(0);
 
+    // Wardriving owns an SD-backed capture table. Finish its queue and flush
+    // before LilyGoLib unmounts the card as part of the sleep sequence.
+    wardriver_prepare_for_sleep();
+
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     esp_wifi_stop();
 
-    instance.powerControl(POWER_NFC, false);
-    instance.powerControl(POWER_GPS, false);
-    instance.powerControl(POWER_RADIO, false);
-    instance.powerControl(POWER_SPEAK, false);
-
-    // Wake on BOOT (GPIO0) or the PMU interrupt used by the power button
-    // (GPIO7). Both are RTC-capable on ESP32-S3.
-    esp_sleep_enable_ext1_wakeup((1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_7),
-                                 ESP_EXT1_WAKEUP_ANY_LOW);
-    esp_deep_sleep_start();
+    // Use the board library's sleep path: it sleeps and ends the display,
+    // flushes/unmounts SD, disables measurement and peripheral rails, clears
+    // PMU IRQ state, resets bus pins, and configures both wake sources.
+    instance.sleep((WakeupSource_t)(WAKEUP_SRC_POWER_KEY | WAKEUP_SRC_BOOT_BUTTON),
+                   false, 0);
 }
 
 // Called by gps_screen after a quality fix to set the longitude-derived UTC offset
@@ -1617,7 +1629,6 @@ void setup()
     wifi_screen_create();
     wifi_radio_screen_create();
     bluetooth_screen_create();
-    stock_screen_create();
     portscan_screen_create();
     analyze_screen_create();
     bt_analyze_screen_create();

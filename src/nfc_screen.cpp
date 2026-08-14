@@ -323,6 +323,11 @@ bool nfc_screen_is_active()
     return lv_screen_active() == nfc_screen;
 }
 
+bool nfc_screen_is_powered()
+{
+    return nfc_powered;
+}
+
 void nfc_screen_worker()
 {
     if (s_read_state == NFC_IDLE) return;

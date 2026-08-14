@@ -35,6 +35,38 @@ This custom firmware turns the T-Watch Ultra into a smartwatch plus a suite of R
 - **Matrix background** — optional animated "digital rain" wallpaper. The bright head still slides through the tiled text without disturbing the chars.
 - **Settings** — brightness, analog/digital face, 12/24-hour, screen-dim timeout and dim level, day/date/AM-PM/seconds toggles, haptic feedback, motion-wake (wrist-raise brightens the screen), a **Screenshot long press** toggle (see below), and a manual date/time picker that overrides automatic GPS/WiFi time sync. Persisted to `/Settings/settings.txt` on SD so the watch boots back into the same configuration. (The auto-detected timezone offset persists separately in `/Settings/timezone.txt` and survives reboots — see **GPS** below.)
 
+### Deep sleep and stock bridge
+
+- **Deep sleep policy** — the Sleep Timer has four independent blockers: **Keep current screen awake**, **Keep WiFi awake**, **Keep radios awake**, and **Keep tools awake**. Turn all four off to let the idle timer stop WiFi, flush a running wardriver log, power down peripheral rails through LilyGoLib, and enter ESP32-S3 deep sleep. Alarms, an active timer/stopwatch, and USB-SD host ownership always remain safety blockers. Wake with the power or boot button.
+- **Stocks / Python remote** — the Stocks tile is a thin, lazy-loaded client for the authenticated local Python bridge in [`tools/stock_bridge.py`](tools/stock_bridge.py). It refreshes up to five quotes and 24-point sparklines, shows Python-job state/progress, and launches one allow-listed preset. It deliberately exposes no brokerage or order API. Credentials and expensive processing remain on the PC/server.
+
+#### Stock bridge setup
+
+1. Copy `tools/stock_bridge.example.json` to `tools/stock_bridge.json`, then replace each preset's `cwd` and exact command with the entry points for your stock program. The bridge executes only commands in this allow-list.
+2. Install and run it:
+
+   ```bash
+   python -m pip install -r tools/requirements-stock-bridge.txt
+   export STOCK_BRIDGE_TOKEN='replace-with-a-long-random-token'
+   export ALPHAVANTAGE_API_KEY='optional-server-side-key'
+   python tools/stock_bridge.py --config tools/stock_bridge.json
+   ```
+
+3. Put this on the watch SD card at `/Stocks/config.txt`:
+
+   ```ini
+   server_url=http://192.168.1.50:8737
+   auth_token=the-same-long-random-token
+   allow_http=1
+   symbols=AAPL,MSFT,SPY,QQQ
+   preset=atlas_weekly
+   device_name=t-watch-1337
+   ```
+
+Plain HTTP is refused unless `allow_http=1`; use it only on a trusted isolated LAN or VPN. For HTTPS, set `server_url=https://...`, leave `allow_http=0`, and copy the issuing CA certificate to `/Stocks/ca.pem` (or set `ca_file` to its SD path). The firmware validates that CA and never bypasses TLS verification.
+
+The bridge first reads `snapshot_file` from its JSON config, allowing an existing optimizer/Atlas script to publish quotes, signals, alerts, and sparklines atomically. [`tools/watch_snapshot.example.json`](tools/watch_snapshot.example.json) documents the format. Missing quotes optionally fall back to server-side Alpha Vantage daily data, cached for five minutes by default.
+
 ### Time, Alarms & Timepieces
 
 - **TIME hub** — swipe **up** from the clock face to land on the timepiece hub, a 2×2 tile grid that opens **Alarm**, **Stopwatch**, **Timer**, and **Calendar**.

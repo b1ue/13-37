@@ -610,6 +610,10 @@ void wardriver_bg_tick()
 }
 
 bool wardriver_is_running()     { return is_running;  }
+void wardriver_prepare_for_sleep()
+{
+    if (is_running) stop_wardriving();
+}
 // Public getters return cumulative counts across all sessions in this run so
 // the home-screen badge keeps climbing past WD_MAX_APS after a rollover.
 int  wardriver_get_wifi_count() { return total_wifi_count + wifi_count; }
