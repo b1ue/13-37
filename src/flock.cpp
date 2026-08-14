@@ -2,6 +2,8 @@
 #include "wifi_beacon_manager.h"
 
 void clock_screen_get_local_time(struct tm *out);
+void clock_screen_show_flock_alert(const char *vendor, const char *confidence,
+                                   int8_t rssi);
 #include "ble_scan_manager.h"
 #include "esp_gap_ble_api.h"
 #include "gps_screen.h"
@@ -80,6 +82,7 @@ struct FlockHit {
     int8_t      rssi;
     const char *vendor;   // static string literal — pointer is always valid
     const char *method;   // "OUI" or "Name" — static string literal
+    FlockConfidence confidence;
     char        name[33];
     char        time_str[16]; // "YYYYMMDD_HHMMSS"
     char        source;   // 'W' = WiFi beacon, 'L' = BLE
@@ -98,6 +101,15 @@ struct DedupSlot {
 static DedupSlot     s_dedup[FLOCK_DEDUP_SLOTS] = {};
 static int           s_count = 0;
 static QueueHandle_t s_queue = nullptr;
+static bool          s_alerts_enabled = false;
+static bool          s_strong_only = false;
+
+static const char *confidence_name(FlockConfidence confidence)
+{
+    if (confidence == FLOCK_CONFIDENCE_HIGH) return "High";
+    if (confidence == FLOCK_CONFIDENCE_MEDIUM) return "Medium";
+    return "Low";
+}
 
 static int oui_match(const uint8_t *mac)
 {
@@ -151,20 +163,31 @@ bool flock_check(const uint8_t *mac6, int8_t rssi, const char *name, char source
 
     // OUI is the higher-confidence signal — prefer it for the method label.
     const char *vendor = (oui_idx >= 0) ? oui_to_vendor(oui_idx) : nm_vendor;
-    const char *method = (oui_idx >= 0) ? "OUI" : "Name";
+    const char *method = "Name";
+    FlockConfidence confidence = FLOCK_CONFIDENCE_LOW;
+    if (oui_idx >= 0) {
+        method = "OUI";
+        confidence = FLOCK_CONFIDENCE_MEDIUM;
+        if (nm_vendor && strcmp(vendor, nm_vendor) == 0) {
+            method = "OUI+Name";
+            confidence = FLOCK_CONFIDENCE_HIGH;
+        }
+    }
+
+    if (!s_queue)
+        s_queue = xQueueCreate(FLOCK_QUEUE_LEN, sizeof(FlockHit));
+    if (!s_queue) return false;
 
     if (!dedup_check_and_add(mac6)) return false;
 
     s_count++;
-
-    if (!s_queue)
-        s_queue = xQueueCreate(FLOCK_QUEUE_LEN, sizeof(FlockHit));
 
     FlockHit hit = {};
     memcpy(hit.mac, mac6, 6);
     hit.rssi   = rssi;
     hit.vendor = vendor;
     hit.method = method;
+    hit.confidence = confidence;
     hit.source = source;
 
     if (name && name[0]) {
@@ -239,6 +262,11 @@ void flock_stop()
 
 bool flock_is_running() { return s_flock_running; }
 
+void flock_set_alerts_enabled(bool enabled) { s_alerts_enabled = enabled; }
+bool flock_alerts_enabled() { return s_alerts_enabled; }
+void flock_set_strong_only(bool enabled) { s_strong_only = enabled; }
+bool flock_strong_only() { return s_strong_only; }
+
 int flock_get_count() { return s_count; }
 
 void flock_reset_count()
@@ -249,7 +277,7 @@ void flock_reset_count()
 
 void flock_bg_tick()
 {
-    if (!s_queue || !instance.isCardReady()) return;
+    if (!s_queue) return;
 
     // One hit per tick - same pattern as the other detectors. A burst of
     // Flock-OUI matches (every dashcam-equipped car nearby) would otherwise
@@ -259,10 +287,23 @@ void flock_bg_tick()
     FlockHit hit;
     if (xQueueReceive(s_queue, &hit, 0) != pdTRUE) return;
 
+    const bool alert = s_alerts_enabled &&
+        (!s_strong_only || hit.confidence == FLOCK_CONFIDENCE_HIGH);
+    if (alert) {
+        instance.vibrator();
+        clock_screen_show_flock_alert(hit.vendor,
+                                      confidence_name(hit.confidence), hit.rssi);
+    }
+
+    // Alerts remain available without an SD card. Logging is local-only and
+    // simply skips the record if storage is unavailable.
+    if (!instance.isCardReady()) return;
+
     SD.mkdir("/Flock");
 
-    char path[48];
-    snprintf(path, sizeof(path), "/Flock/%s.txt", hit.time_str);
+    char path[64];
+    snprintf(path, sizeof(path), "/Flock/%s_%02X%02X%02X.txt",
+             hit.time_str, hit.mac[3], hit.mac[4], hit.mac[5]);
 
     File f = SD.open(path, FILE_WRITE);
     if (!f) return;
@@ -274,6 +315,7 @@ void flock_bg_tick()
     f.printf("Source: %s\n", hit.source == 'W' ? "WiFi" : "BLE");
     f.printf("Vendor: %s\n", hit.vendor);
     f.printf("Method: %s\n", hit.method);
+    f.printf("Confidence: %s\n", confidence_name(hit.confidence));
     if (hit.name[0])
         f.printf("Name:   %s\n", hit.name);
     f.printf("RSSI:   %d dBm\n", (int)hit.rssi);
@@ -282,11 +324,61 @@ void flock_bg_tick()
     // the other detectors and keeps the FlockHit struct unchanged.
     // The queue typically drains within a tick, so the position is
     // effectively "where we were when we saw it".
-    if (gps_screen_has_lock() && instance.gps.location.isValid()) {
-        f.printf("GPS:    %.6f,%.6f\n",
-            instance.gps.location.lat(), instance.gps.location.lng());
-        if (instance.gps.altitude.isValid())
-            f.printf("Alt:    %.1fm\n", instance.gps.altitude.meters());
+    const bool have_gps = gps_screen_has_lock() && instance.gps.location.isValid();
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double altitude = 0.0;
+    uint32_t satellites = 0;
+    double hdop = 0.0;
+    bool have_altitude = false;
+    bool have_satellites = false;
+    bool have_hdop = false;
+    if (have_gps) {
+        latitude = instance.gps.location.lat();
+        longitude = instance.gps.location.lng();
+        have_altitude = instance.gps.altitude.isValid();
+        have_satellites = instance.gps.satellites.isValid();
+        have_hdop = instance.gps.hdop.isValid();
+        if (have_altitude) altitude = instance.gps.altitude.meters();
+        if (have_satellites) satellites = instance.gps.satellites.value();
+        if (have_hdop) hdop = instance.gps.hdop.hdop();
+        f.printf("GPS:    %.6f,%.6f\n", latitude, longitude);
+        if (have_altitude) f.printf("Alt:    %.1fm\n", altitude);
+        if (have_satellites && have_hdop)
+            f.printf("GPS quality: %lu sats, HDOP %.1f\n",
+                     (unsigned long)satellites, hdop);
+        else if (have_satellites)
+            f.printf("GPS quality: %lu sats\n", (unsigned long)satellites);
+        else if (have_hdop)
+            f.printf("GPS quality: HDOP %.1f\n", hdop);
     }
     f.close();
+
+    // Compact offline-map index. It contains observations only and is never
+    // transmitted by the firmware.
+    const char *index_path = "/Flock/sightings.csv";
+    const bool new_index = !SD.exists(index_path);
+    File index = SD.open(index_path, FILE_APPEND);
+    if (!index) return;
+    if (new_index)
+        index.println("time,mac,source,vendor,method,confidence,rssi,lat,lon,alt_m,sats,hdop");
+    index.printf("%s,%02X:%02X:%02X:%02X:%02X:%02X,%s,%s,%s,%s,%d,",
+                 hit.time_str,
+                 hit.mac[0], hit.mac[1], hit.mac[2],
+                 hit.mac[3], hit.mac[4], hit.mac[5],
+                 hit.source == 'W' ? "WiFi" : "BLE",
+                 hit.vendor, hit.method, confidence_name(hit.confidence),
+                 (int)hit.rssi);
+    if (have_gps) {
+        index.printf("%.6f,%.6f,", latitude, longitude);
+        if (have_altitude) index.printf("%.1f", altitude);
+        index.print(',');
+        if (have_satellites) index.printf("%lu", (unsigned long)satellites);
+        index.print(',');
+        if (have_hdop) index.printf("%.1f", hdop);
+        index.println();
+    } else {
+        index.println(",,,,");
+    }
+    index.close();
 }

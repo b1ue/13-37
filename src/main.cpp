@@ -37,6 +37,8 @@
 #include "analyze_screen.h"
 #include "bt_analyze_screen.h"
 #include "lora_analyze_screen.h"
+#include "rolling_code.h"
+#include "rolling_code_screen.h"
 #include "pingsweep.h"
 #include "hostresolve.h"
 #include "portscan.h"
@@ -134,6 +136,8 @@ static lv_obj_t *evil_twin_count_label;
 // Flock/OUI surveillance-device indicator (left of AirTag indicator)
 static lv_obj_t *flock_indicator;
 static lv_obj_t *flock_count_label;
+static lv_obj_t *flock_alert_banner;
+static lv_timer_t *flock_alert_timer;
 
 // Battery body geometry (pixels)
 static constexpr int BAT_W      = 60;                       // halved from 120
@@ -312,7 +316,7 @@ static void update_lora_indicator()
     // the pager scanner, the TPMS scanner, APRS, or the LoRa analyzer.
     bool in_use = lora_screen_is_powered() || pager_is_running()
                || tpms_is_running() || aprs_is_running()
-               || lora_analyze_is_running();
+               || lora_analyze_is_running() || rolling_code_is_running();
     lv_color_t color = in_use
         ? theme_accent_bright()
         : lv_color_make(0x33, 0x33, 0x33);
@@ -937,6 +941,61 @@ void clock_screen_set_sleep_timeout(uint32_t ms)
     s_last_activity_ms = millis();
 }
 
+static void dismiss_flock_alert(lv_timer_t *)
+{
+    if (flock_alert_banner) {
+        lv_obj_del(flock_alert_banner);
+        flock_alert_banner = nullptr;
+    }
+    flock_alert_timer = nullptr;
+}
+
+void clock_screen_show_flock_alert(const char *vendor, const char *confidence,
+                                   int8_t rssi)
+{
+    dim_reset_activity();
+
+    if (flock_alert_timer) {
+        lv_timer_del(flock_alert_timer);
+        flock_alert_timer = nullptr;
+    }
+    if (flock_alert_banner) {
+        lv_obj_del(flock_alert_banner);
+        flock_alert_banner = nullptr;
+    }
+
+    lv_obj_t *active = lv_screen_active();
+    if (!active) return;
+    flock_alert_banner = lv_obj_create(active);
+    lv_obj_set_size(flock_alert_banner, 390, 76);
+    lv_obj_align(flock_alert_banner, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_set_style_bg_color(flock_alert_banner, lv_color_make(0x18, 0x0C, 0x00), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(flock_alert_banner, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_border_color(flock_alert_banner, lv_color_make(0xFF, 0x88, 0x00), LV_PART_MAIN);
+    lv_obj_set_style_border_width(flock_alert_banner, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(flock_alert_banner, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(flock_alert_banner, 6, LV_PART_MAIN);
+    lv_obj_clear_flag(flock_alert_banner, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(flock_alert_banner);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_make(0xFF, 0xAA, 0x22), LV_PART_MAIN);
+    lv_label_set_text(title, "PRIVACY DETECTOR");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *detail = lv_label_create(flock_alert_banner);
+    lv_obj_set_style_text_font(detail, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(detail, lv_color_white(), LV_PART_MAIN);
+    lv_label_set_text_fmt(detail, "%s | %s | %d dBm",
+                          vendor ? vendor : "Match",
+                          confidence ? confidence : "Unknown", (int)rssi);
+    lv_obj_align(detail, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_move_foreground(flock_alert_banner);
+
+    flock_alert_timer = lv_timer_create(dismiss_flock_alert, 5000, nullptr);
+    lv_timer_set_repeat_count(flock_alert_timer, 1);
+}
+
 void clock_screen_set_keep_awake_screen(bool enabled) { s_keep_awake_screen = enabled; }
 void clock_screen_set_keep_awake_wifi(bool enabled)   { s_keep_awake_wifi = enabled; }
 void clock_screen_set_keep_awake_radios(bool enabled) { s_keep_awake_radios = enabled; }
@@ -1023,7 +1082,8 @@ static bool idle_deep_sleep_allowed()
     if (s_keep_awake_radios &&
         (gps_screen_is_powered() || nfc_screen_is_powered() ||
          lora_screen_is_powered() || pager_is_running() || tpms_is_running() ||
-         aprs_is_running() || lora_analyze_is_running() || meshtastic_is_active() ||
+         aprs_is_running() || lora_analyze_is_running() || rolling_code_is_running() ||
+         meshtastic_is_active() ||
          bluetooth_screen_is_powered() || ble_scan_active() ||
          mouse_hid_is_running())) return false;
 
@@ -1046,6 +1106,7 @@ static void enter_idle_deep_sleep()
     // Wardriving owns an SD-backed capture table. Finish its queue and flush
     // before LilyGoLib unmounts the card as part of the sleep sequence.
     wardriver_prepare_for_sleep();
+    rolling_code_prepare_for_sleep();
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -1696,6 +1757,7 @@ void setup()
     analyze_screen_create();
     bt_analyze_screen_create();
     lora_analyze_screen_create();
+    rolling_code_screen_create();
     stopwatch_screen_create();
     timer_screen_create();
     alarm_screen_create();
@@ -1819,6 +1881,9 @@ void loop()
                 tools_screen_show();
             } else if (about_screen_is_active()) {
                 tools_screen_show();
+            } else if (rolling_code_screen_is_active()) {
+                rolling_code_screen_stop();
+                tools_screen_show();
             } else if (wifi_radio_screen_is_active()) {
                 lora_screen_show();
             } else if (lora_screen_is_active()) {
@@ -1913,6 +1978,7 @@ void loop()
         tpms_bg_tick();
         pager_bg_tick();
         aprs_bg_tick();   // RX drain + queued TX; SD logging self-gates on USB SD
+        rolling_code_worker(); // receive-only pulse captures; one queued frame per loop
         pingsweep_poll(); // writes /PingSweeps/ once a sweep finishes
         portscan_poll();  // writes /PingSweeps/portscan_* once a scan finishes
         nfc_screen_worker();

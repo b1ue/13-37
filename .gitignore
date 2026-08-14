@@ -1,4 +1,5 @@
 .pio
+.pio-core/
 .test-venv/
 __pycache__/
 .env

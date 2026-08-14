@@ -1,6 +1,7 @@
 #include "settings_screen.h"
 #include "usb_sd.h"
 #include "matrix_bg.h"
+#include "flock.h"
 #include "theme.h"
 #include <LilyGoLib.h>
 #include <SD.h>
@@ -47,6 +48,10 @@ static lv_obj_t *matrix_switch;
 static lv_obj_t *matrix_val_label;
 static lv_obj_t *stock_rain_switch;
 static lv_obj_t *stock_rain_val_label;
+static lv_obj_t *flock_alert_switch;
+static lv_obj_t *flock_alert_val_label;
+static lv_obj_t *flock_strong_switch;
+static lv_obj_t *flock_strong_val_label;
 static lv_obj_t *theme_switch;
 static lv_obj_t *theme_val_label;
 static lv_obj_t *dim_dropdown;
@@ -270,6 +275,22 @@ static void on_stock_rain_changed(lv_event_t *)
     bool on = lv_obj_has_state(stock_rain_switch, LV_STATE_CHECKED);
     lv_label_set_text(stock_rain_val_label, on ? "On" : "Off");
     matrix_bg_set_stock_data(on);
+    settings_save_to_sd();
+}
+
+static void on_flock_alert_changed(lv_event_t *)
+{
+    bool on = lv_obj_has_state(flock_alert_switch, LV_STATE_CHECKED);
+    lv_label_set_text(flock_alert_val_label, on ? "On" : "Off");
+    flock_set_alerts_enabled(on);
+    settings_save_to_sd();
+}
+
+static void on_flock_strong_changed(lv_event_t *)
+{
+    bool on = lv_obj_has_state(flock_strong_switch, LV_STATE_CHECKED);
+    lv_label_set_text(flock_strong_val_label, on ? "On" : "Off");
+    flock_set_strong_only(on);
     settings_save_to_sd();
 }
 
@@ -1165,6 +1186,64 @@ void settings_screen_create()
     lv_obj_add_event_cb(stock_rain_switch, on_stock_rain_changed, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_align(stock_rain_switch, LV_ALIGN_RIGHT_MID, 0, 0);
 
+    // Passive detector notifications. The preferences do not start radios or
+    // add a deep-sleep blocker; an actual alert wakes the display briefly.
+    lv_obj_t *flock_alert_row = lv_obj_create(settings_screen);
+    lv_obj_set_size(flock_alert_row, 380, 40);
+    lv_obj_set_style_bg_opa(flock_alert_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(flock_alert_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(flock_alert_row, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(flock_alert_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(flock_alert_row, LV_ALIGN_TOP_MID, 0, 1594);
+    register_shiftable(flock_alert_row, 1594);
+
+    lv_obj_t *flock_alert_lbl = lv_label_create(flock_alert_row);
+    lv_obj_set_style_text_color(flock_alert_lbl, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(flock_alert_lbl, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(flock_alert_lbl, "Flock Alerts");
+    lv_obj_align(flock_alert_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    flock_alert_val_label = lv_label_create(flock_alert_row);
+    lv_obj_set_style_text_color(flock_alert_val_label, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(flock_alert_val_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(flock_alert_val_label, "Off");
+    lv_obj_align(flock_alert_val_label, LV_ALIGN_RIGHT_MID, -80, 0);
+
+    flock_alert_switch = lv_switch_create(flock_alert_row);
+    lv_obj_set_size(flock_alert_switch, 70, 34);
+    lv_obj_set_style_bg_color(flock_alert_switch, lv_color_make(0x44, 0x44, 0x44), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(flock_alert_switch, lv_color_make(0xFF, 0x88, 0x00), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(flock_alert_switch, on_flock_alert_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_align(flock_alert_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    lv_obj_t *flock_strong_row = lv_obj_create(settings_screen);
+    lv_obj_set_size(flock_strong_row, 380, 40);
+    lv_obj_set_style_bg_opa(flock_strong_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(flock_strong_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(flock_strong_row, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(flock_strong_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(flock_strong_row, LV_ALIGN_TOP_MID, 0, 1642);
+    register_shiftable(flock_strong_row, 1642);
+
+    lv_obj_t *flock_strong_lbl = lv_label_create(flock_strong_row);
+    lv_obj_set_style_text_color(flock_strong_lbl, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(flock_strong_lbl, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(flock_strong_lbl, "Strong Only");
+    lv_obj_align(flock_strong_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    flock_strong_val_label = lv_label_create(flock_strong_row);
+    lv_obj_set_style_text_color(flock_strong_val_label, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(flock_strong_val_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(flock_strong_val_label, "Off");
+    lv_obj_align(flock_strong_val_label, LV_ALIGN_RIGHT_MID, -80, 0);
+
+    flock_strong_switch = lv_switch_create(flock_strong_row);
+    lv_obj_set_size(flock_strong_switch, 70, 34);
+    lv_obj_set_style_bg_color(flock_strong_switch, lv_color_make(0x44, 0x44, 0x44), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(flock_strong_switch, lv_color_make(0xFF, 0x88, 0x00), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(flock_strong_switch, on_flock_strong_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_align(flock_strong_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+
     // Screenshot and theme rows were registered after the earlier layout
     // pass; include them in the initial manual-time collapse as well.
     apply_layout();
@@ -1228,6 +1307,8 @@ static void settings_save_to_sd()
     f.printf("show_secs=%d\n",       lv_obj_has_state(secs_switch,        LV_STATE_CHECKED) ? 1 : 0);
     f.printf("matrix=%d\n",          lv_obj_has_state(matrix_switch,      LV_STATE_CHECKED) ? 1 : 0);
     f.printf("stock_data_rain=%d\n",lv_obj_has_state(stock_rain_switch,  LV_STATE_CHECKED) ? 1 : 0);
+    f.printf("flock_alerts=%d\n",    lv_obj_has_state(flock_alert_switch, LV_STATE_CHECKED) ? 1 : 0);
+    f.printf("flock_strong_only=%d\n",lv_obj_has_state(flock_strong_switch, LV_STATE_CHECKED) ? 1 : 0);
     f.printf("blue_theme=%d\n",      lv_obj_has_state(theme_switch,       LV_STATE_CHECKED) ? 1 : 0);
     f.printf("show_day=%d\n",        lv_obj_has_state(show_day_switch,    LV_STATE_CHECKED) ? 1 : 0);
     f.printf("show_date=%d\n",       lv_obj_has_state(show_date_switch,   LV_STATE_CHECKED) ? 1 : 0);
@@ -1310,6 +1391,14 @@ void settings_screen_load()
             apply_switch(stock_rain_switch, b);
             lv_label_set_text(stock_rain_val_label, b ? "On" : "Off");
             matrix_bg_set_stock_data(b);
+        } else if (key == "flock_alerts") {
+            apply_switch(flock_alert_switch, b);
+            lv_label_set_text(flock_alert_val_label, b ? "On" : "Off");
+            flock_set_alerts_enabled(b);
+        } else if (key == "flock_strong_only") {
+            apply_switch(flock_strong_switch, b);
+            lv_label_set_text(flock_strong_val_label, b ? "On" : "Off");
+            flock_set_strong_only(b);
         } else if (key == "blue_theme") {
             apply_switch(theme_switch, b);
             lv_label_set_text(theme_val_label, b ? "Blue" : "Green");

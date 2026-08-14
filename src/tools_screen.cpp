@@ -14,6 +14,7 @@
 #include "stock_screen.h"
 #include "analyze_screen.h"
 #include "about_screen.h"
+#include "rolling_code_screen.h"
 #include "theme.h"
 #include <LilyGoLib.h>
 
@@ -920,6 +921,31 @@ static void draw_stock_icon(lv_obj_t *tile)
     lv_obj_align(ticker, LV_ALIGN_TOP_MID, 46, 28);
 }
 
+// Rolling RX — alternating pulse train under a receive-only label. The tool
+// has no transmit/replay API; the icon intentionally uses RX instead of a
+// remote-control glyph to keep that boundary visible.
+static void draw_rolling_rx_icon(lv_obj_t *tile)
+{
+    static const int heights[] = { 20, 62, 32, 88, 24, 70, 40 };
+    for (int i = 0; i < 7; ++i) {
+        lv_obj_t *bar = lv_obj_create(tile);
+        lv_obj_set_size(bar, 10, heights[i]);
+        lv_obj_set_style_bg_color(bar,
+            i & 1 ? lv_color_make(0x44, 0xAA, 0xFF)
+                  : lv_color_make(0x00, 0xCC, 0x66), LV_PART_MAIN);
+        lv_obj_set_style_border_width(bar, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(bar, 2, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(bar, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 42 + i * 16, 112 - heights[i]);
+    }
+    lv_obj_t *rx = lv_label_create(tile);
+    lv_obj_set_style_text_font(rx, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rx, lv_color_white(), LV_PART_MAIN);
+    lv_label_set_text(rx, "RX");
+    lv_obj_align(rx, LV_ALIGN_TOP_MID, 0, 33);
+}
+
 static void draw_about_icon(lv_obj_t *tile)
 {
     lv_obj_t *disc = lv_obj_create(tile);
@@ -982,6 +1008,7 @@ void tools_screen_create()
     //   [Stocks]    [AirTag]
     //   [Flipper]   [Skimmers]
     //   [Evil Twin] [Flock]
+    //   [Rolling RX] [About]
     // The timepiece tiles (Alarm / Stopwatch / Timer / Calendar) used to live
     // at the bottom of this grid; they moved to the TIME screen (swipe up
     // from the clock face).
@@ -999,6 +1026,7 @@ void tools_screen_create()
     t_skimmer           = make_tile(grid, "Skimmers");
     t_eviltwin          = make_tile(grid, "Evil Twin");
     t_flock             = make_tile(grid, "Flock");
+    lv_obj_t *t_rolling = make_tile(grid, "Rolling RX");
     lv_obj_t *t_about   = make_tile(grid, "About");
 
     draw_wifi_icon(t_wifi);
@@ -1015,6 +1043,7 @@ void tools_screen_create()
     draw_skimmer_icon(t_skimmer);
     draw_eviltwin_icon(t_eviltwin);
     draw_flock_icon(t_flock);
+    draw_rolling_rx_icon(t_rolling);
     draw_about_icon(t_about);
 
     // Tesla CP tile opens the 315 MHz charge-port-open transmit screen.
@@ -1045,6 +1074,11 @@ void tools_screen_create()
     // Flock tile toggles the surveillance-vendor detector (WiFi + BLE scan).
     lv_obj_add_event_cb(t_flock, on_flock_clicked, LV_EVENT_CLICKED, NULL);
     set_flock_tile_running(flock_is_running());
+
+    // Receive-only pulse timing and change correlation. There is deliberately
+    // no replay or transmit control on the destination screen.
+    lv_obj_add_event_cb(t_rolling, [](lv_event_t *) { rolling_code_screen_show(); },
+                        LV_EVENT_CLICKED, NULL);
 
     // TPMS tile opens the TPMS monitor screen.
     lv_obj_add_event_cb(t_tpms, [](lv_event_t *) { tpms_screen_show(); }, LV_EVENT_CLICKED, NULL);
