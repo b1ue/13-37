@@ -1,5 +1,5 @@
 {
-  "message": "Latest Atlas run complete",
+  "message": "Private workflow complete",
   "quotes": {
     "AAPL": {
       "price": "232.10",
@@ -11,10 +11,10 @@
   },
   "alerts": [
     {
-      "id": "atlas-aapl-20260813",
+      "id": "watch-aapl-20260813",
       "severity": "info",
-      "title": "AAPL signal updated",
-      "message": "See the generated Atlas report."
+      "title": "AAPL data updated",
+      "message": "See the private report."
     }
   ]
 }

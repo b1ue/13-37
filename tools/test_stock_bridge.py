@@ -20,7 +20,7 @@ class StockBridgeTests(unittest.TestCase):
             '"spark":[120,121,123.45]}}}',
             encoding="utf-8",
         )
-        os.environ["TEST_STOCK_BRIDGE_TOKEN"] = "unit-test-token"
+        os.environ["TEST_STOCK_BRIDGE_TOKEN"] = "unit-test-token-32-characters-long"
         self.config = {
             "_config_dir": str(root),
             "auth_token_env": "TEST_STOCK_BRIDGE_TOKEN",
@@ -34,7 +34,7 @@ class StockBridgeTests(unittest.TestCase):
             },
         }
         self.client = TestClient(stock_bridge.create_app(self.config))
-        self.auth = {"Authorization": "Bearer unit-test-token"}
+        self.auth = {"Authorization": "Bearer unit-test-token-32-characters-long"}
 
     def tearDown(self):
         self.client.close()
@@ -43,6 +43,17 @@ class StockBridgeTests(unittest.TestCase):
 
     def test_authentication_is_required(self):
         self.assertEqual(self.client.get("/api/status").status_code, 401)
+
+    def test_api_schema_is_not_public(self):
+        self.assertEqual(self.client.get("/openapi.json").status_code, 404)
+        self.assertEqual(
+            self.client.get("/api/presets", headers=self.auth).status_code, 404
+        )
+
+    def test_security_headers_disable_caching(self):
+        response = self.client.get("/api/status", headers=self.auth)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
 
     def test_watch_snapshot_protocol(self):
         response = self.client.get(
@@ -63,6 +74,8 @@ class StockBridgeTests(unittest.TestCase):
             "/api/jobs", headers=self.auth, json={"preset": "test"}
         )
         self.assertEqual(started.status_code, 202)
+        self.assertNotIn("preset", started.json())
+        self.assertNotIn("log_tail", started.json())
         deadline = time.time() + 5
         state = ""
         while time.time() < deadline:

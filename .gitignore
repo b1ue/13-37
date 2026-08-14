@@ -1,6 +1,16 @@
 .pio
 .test-venv/
 __pycache__/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+tools/stock_bridge.json
+tools/stock_bridge.local.json
+stock-output/
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json

@@ -44,13 +44,14 @@ static volatile bool      s_connected = false;
 static BLEServer         *s_server    = nullptr;
 static BLEHIDDevice      *s_hid       = nullptr;
 static BLECharacteristic *s_input     = nullptr;
+static bool               s_stopping  = false;
 
 class MouseServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer *) override { s_connected = true; }
     void onDisconnect(BLEServer *) override {
         s_connected = false;
         // Re-advertise so the host (or a different one) can reconnect.
-        if (s_running) BLEDevice::startAdvertising();
+        if (s_running && !s_stopping) BLEDevice::startAdvertising();
     }
 };
 static MouseServerCallbacks s_server_cbs;
@@ -79,7 +80,9 @@ bool mouse_hid_start()
     // (AirTag / wardriver) currently holds it.
     if (ble_scan_active()) return false;
 
+    s_stopping = false;
     BLEDevice::init("T-Watch Mouse");
+    if (!BLEDevice::getInitialized()) return false;
 
     s_server = BLEDevice::createServer();
     if (!s_server) {                  // BLE stack failed to come up
@@ -143,8 +146,29 @@ bool mouse_hid_start()
 void mouse_hid_stop()
 {
     if (!s_running) return;
+    s_stopping = true;
     s_running   = false;
+    BLEDevice::stopAdvertising();
+
+    if (s_server) {
+        std::map<uint16_t, conn_status_t> peers = s_server->getPeerDevices(false);
+        for (const auto &peer : peers) s_server->disconnect(peer.first);
+
+        uint32_t deadline = millis() + 300;
+        while (s_server->getConnectedCount() > 0 &&
+               (int32_t)(deadline - millis()) > 0) {
+            delay(10);
+        }
+
+        if (s_hid) {
+            s_server->removeService(s_hid->hidService());
+            s_server->removeService(s_hid->batteryService());
+            s_server->removeService(s_hid->deviceInfo());
+        }
+    }
     s_connected = false;
+    delete s_hid;
+    s_hid = nullptr;
 
     // deinit(false): tear down the stack but keep controller memory, so the BLE
     // scanners (or a later mouse restart) can bring BLE back up. Note: this BLE
@@ -154,6 +178,7 @@ void mouse_hid_stop()
     s_server = nullptr;
     s_hid    = nullptr;
     s_input  = nullptr;
+    s_stopping = false;
 }
 
 bool mouse_hid_is_running()   { return s_running;   }

@@ -13,6 +13,8 @@
 #include "wifi_screen.h"
 #include "stock_screen.h"
 #include "analyze_screen.h"
+#include "about_screen.h"
+#include "theme.h"
 #include <LilyGoLib.h>
 
 // Defined in main.cpp
@@ -25,6 +27,8 @@ static lv_obj_t *t_flipper;   // referenced by on_flipper_clicked for colour swa
 static lv_obj_t *t_skimmer;   // referenced by on_skimmer_clicked for colour swap
 static lv_obj_t *t_eviltwin;  // referenced by on_eviltwin_clicked for colour swap
 static lv_obj_t *t_flock;     // referenced by on_flock_clicked for colour swap
+static lv_obj_t *t_about_disc;
+static lv_obj_t *t_about_info;
 
 static void on_gesture(lv_event_t *e)
 {
@@ -37,7 +41,7 @@ static void on_gesture(lv_event_t *e)
 static void set_airtag_tile_running(bool running)
 {
     lv_obj_set_style_bg_color(t_airtag,
-        running ? lv_color_make(0x00, 0x55, 0x22)
+        running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
 }
@@ -56,7 +60,7 @@ static void on_airtag_clicked(lv_event_t *e)
 static void set_flipper_tile_running(bool running)
 {
     lv_obj_set_style_bg_color(t_flipper,
-        running ? lv_color_make(0x00, 0x55, 0x22)
+        running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
 }
@@ -75,7 +79,7 @@ static void on_flipper_clicked(lv_event_t *e)
 static void set_skimmer_tile_running(bool running)
 {
     lv_obj_set_style_bg_color(t_skimmer,
-        running ? lv_color_make(0x00, 0x55, 0x22)
+        running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
 }
@@ -94,7 +98,7 @@ static void on_skimmer_clicked(lv_event_t *e)
 static void set_eviltwin_tile_running(bool running)
 {
     lv_obj_set_style_bg_color(t_eviltwin,
-        running ? lv_color_make(0x00, 0x55, 0x22)
+        running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
 }
@@ -113,7 +117,7 @@ static void on_eviltwin_clicked(lv_event_t *e)
 static void set_flock_tile_running(bool running)
 {
     lv_obj_set_style_bg_color(t_flock,
-        running ? lv_color_make(0x00, 0x55, 0x22)
+        running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
 }
@@ -916,6 +920,27 @@ static void draw_stock_icon(lv_obj_t *tile)
     lv_obj_align(ticker, LV_ALIGN_TOP_MID, 46, 28);
 }
 
+static void draw_about_icon(lv_obj_t *tile)
+{
+    lv_obj_t *disc = lv_obj_create(tile);
+    t_about_disc = disc;
+    lv_obj_set_size(disc, 82, 82);
+    lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(disc, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_color(disc, theme_accent_bright(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(disc, 4, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(disc, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(disc, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(disc, LV_ALIGN_TOP_MID, 0, 28);
+
+    lv_obj_t *info = lv_label_create(tile);
+    t_about_info = info;
+    lv_label_set_text(info, "i");
+    lv_obj_set_style_text_color(info, theme_accent_bright(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 39);
+}
+
 void tools_screen_create()
 {
     tools_screen = lv_obj_create(NULL);
@@ -974,6 +999,7 @@ void tools_screen_create()
     t_skimmer           = make_tile(grid, "Skimmers");
     t_eviltwin          = make_tile(grid, "Evil Twin");
     t_flock             = make_tile(grid, "Flock");
+    lv_obj_t *t_about   = make_tile(grid, "About");
 
     draw_wifi_icon(t_wifi);
     draw_analyzer_icon(t_analyze);
@@ -989,6 +1015,7 @@ void tools_screen_create()
     draw_skimmer_icon(t_skimmer);
     draw_eviltwin_icon(t_eviltwin);
     draw_flock_icon(t_flock);
+    draw_about_icon(t_about);
 
     // Tesla CP tile opens the 315 MHz charge-port-open transmit screen.
     lv_obj_add_event_cb(t_tesla, [](lv_event_t *) { tesla_cp_screen_show(); }, LV_EVENT_CLICKED, NULL);
@@ -1040,6 +1067,8 @@ void tools_screen_create()
     // Analyze tile opens the WiFi channel utilisation visualisation.
     lv_obj_add_event_cb(t_analyze, [](lv_event_t *) { analyze_screen_show(); }, LV_EVENT_CLICKED, NULL);
 
+    lv_obj_add_event_cb(t_about, [](lv_event_t *) { about_screen_show(); }, LV_EVENT_CLICKED, NULL);
+
     // lv_obj_create() creates objects with LV_OBJ_FLAG_CLICKABLE set by
     // default, so the icon shapes inside each tile would otherwise swallow
     // CLICKED events instead of letting them reach the tile. Walk every tile
@@ -1060,6 +1089,17 @@ void tools_screen_create()
 
 void tools_screen_show()
 {
+    // Refresh running-state tiles so changing the accent theme in Settings is
+    // reflected the next time Tools opens.
+    set_airtag_tile_running(airtag_is_running());
+    set_flipper_tile_running(flipper_is_running());
+    set_skimmer_tile_running(skimmer_is_running());
+    set_eviltwin_tile_running(evil_twin_is_running());
+    set_flock_tile_running(flock_is_running());
+    if (t_about_disc)
+        lv_obj_set_style_border_color(t_about_disc, theme_accent_bright(), LV_PART_MAIN);
+    if (t_about_info)
+        lv_obj_set_style_text_color(t_about_info, theme_accent_bright(), LV_PART_MAIN);
     main_loop_request_lvgl_priority(12);
     lv_scr_load(tools_screen);
 }

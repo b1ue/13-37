@@ -20,12 +20,13 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 @dataclass
@@ -45,8 +46,13 @@ class Job:
 
 
 class JobRequest(BaseModel):
-    preset: str
-    device_name: str = "t-watch-1337"
+    preset: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    device_name: str = Field(
+        default="t-watch-1337",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_. -]+$",
+    )
 
 
 class BridgeState:
@@ -143,20 +149,27 @@ def latest_job(state: BridgeState) -> Job | None:
         return max(state.jobs.values(), key=lambda item: item.created_at, default=None)
 
 
-def public_job(job: Job) -> dict[str, Any]:
-    return {
+def public_job(job: Job, expose_details: bool = False) -> dict[str, Any]:
+    result = {
         "id": job.id,
-        "preset": job.preset,
-        "device_name": job.device_name,
         "state": job.state,
         "progress": job.progress,
-        "message": job.message,
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
         "return_code": job.return_code,
-        "log_tail": list(job.log_tail),
     }
+    # Program output, private preset IDs, and device naming can reveal how a
+    # private strategy is organized. Keep them server-side unless the operator
+    # explicitly opts into this diagnostic surface.
+    if expose_details:
+        result.update({
+            "preset": job.preset,
+            "device_name": job.device_name,
+            "message": job.message,
+            "log_tail": list(job.log_tail),
+        })
+    return result
 
 
 def run_job(config: dict[str, Any], state: BridgeState, job: Job, preset: dict[str, Any]) -> None:
@@ -224,25 +237,48 @@ def run_job(config: dict[str, Any], state: BridgeState, job: Job, preset: dict[s
 
 def create_app(config: dict[str, Any]) -> FastAPI:
     state = BridgeState()
+    expose_job_details = bool(config.get("expose_job_details", False))
     token_env = config.get("auth_token_env", "STOCK_BRIDGE_TOKEN")
-    expected_token = os.environ.get(token_env, config.get("auth_token", ""))
+    expected_token = os.environ.get(token_env, "")
     if not expected_token:
         raise RuntimeError(f"Set {token_env}; the bridge refuses to run without authentication")
+    if len(expected_token) < 32:
+        raise RuntimeError(f"{token_env} must contain at least 32 characters")
 
     def authorize(authorization: str | None = Header(default=None)) -> None:
         scheme, _, supplied = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected_token):
             raise HTTPException(status_code=401, detail="Invalid bearer token")
 
-    app = FastAPI(title="T-Watch 1337 Stock Bridge", version="1.0")
+    app = FastAPI(
+        title="T-Watch 1337 Stock Bridge",
+        version="1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Response:
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
 
     @app.get("/api/status", dependencies=[Depends(authorize)])
     def status() -> dict[str, Any]:
         job = latest_job(state)
-        return {"state": job.state if job else "idle", "job": public_job(job) if job else None}
+        return {
+            "state": job.state if job else "idle",
+            "job": public_job(job, expose_job_details) if job else None,
+        }
 
     @app.get("/api/presets", dependencies=[Depends(authorize)])
     def presets() -> dict[str, Any]:
+        if not expose_job_details:
+            raise HTTPException(status_code=404, detail="Not found")
         return {"presets": sorted(config.get("presets", {}))}
 
     @app.get("/api/alerts", dependencies=[Depends(authorize)])
@@ -253,6 +289,8 @@ def create_app(config: dict[str, Any]) -> FastAPI:
 
     @app.post("/api/alerts/{alert_id}/ack", dependencies=[Depends(authorize)])
     def acknowledge(alert_id: str) -> dict[str, bool]:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", alert_id):
+            raise HTTPException(status_code=400, detail="Invalid alert id")
         with state.lock:
             state.acked_alerts.add(alert_id)
         return {"ok": True}
@@ -270,7 +308,7 @@ def create_app(config: dict[str, Any]) -> FastAPI:
         with state.lock:
             state.jobs[job.id] = job
         threading.Thread(target=run_job, args=(config, state, job, preset), daemon=True).start()
-        return public_job(job)
+        return public_job(job, expose_job_details)
 
     @app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(authorize)])
     def cancel_job(job_id: str) -> dict[str, Any]:
@@ -280,11 +318,11 @@ def create_app(config: dict[str, Any]) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Unknown job")
             process = job.process
             if job.state not in {"queued", "running"}:
-                return public_job(job)
+                return public_job(job, expose_job_details)
             job.state = "cancelling"
         if process:
             process.terminate()
-        return public_job(job)
+        return public_job(job, expose_job_details)
 
     @app.get("/api/watch/snapshot", response_class=PlainTextResponse, dependencies=[Depends(authorize)])
     def watch_snapshot(symbols: str = Query(default="AAPL,MSFT,SPY,QQQ")) -> str:
@@ -300,7 +338,14 @@ def create_app(config: dict[str, Any]) -> FastAPI:
         job = latest_job(state)
         status_text = snapshot.get("message", "")
         if job:
-            status_text = job.message
+            status_text = job.message if expose_job_details else {
+                "queued": "Private job queued",
+                "running": "Private job running",
+                "cancelling": "Private job cancelling",
+                "cancelled": "Private job cancelled",
+                "complete": "Private job complete",
+                "failed": "Private job failed",
+            }.get(job.state, "Private job active")
             status_line = f"{job.state}|{status_text}|{job.progress}"
         else:
             status_line = f"idle|{status_text or 'Ready'}|"
@@ -331,12 +376,26 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
     config = load_config(args.config)
+    host = str(args.host or config.get("host", "127.0.0.1"))
+    try:
+        is_loopback = host.lower() == "localhost" or ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback and not config.get("allow_remote", False):
+        raise RuntimeError(
+            "Refusing a non-loopback bind; set allow_remote=true only behind TLS, a VPN, "
+            "or a trusted isolated LAN firewall"
+        )
     import uvicorn
     uvicorn.run(
         create_app(config),
-        host=args.host or config.get("host", "127.0.0.1"),
+        host=host,
         port=args.port or int(config.get("port", 8737)),
         log_level="info",
+        access_log=False,
+        date_header=False,
+        proxy_headers=False,
+        server_header=False,
     )
 
 

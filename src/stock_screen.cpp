@@ -65,10 +65,12 @@ static lv_obj_t *run_btn_label;
 static char s_server_url[160] = "";
 static char s_auth_token[96] = "";
 static char s_ca_file[64] = "/Stocks/ca.pem";
-static char s_preset[40] = "atlas_weekly";
+static char s_preset[40] = "private_job";
 static char s_device_name[40] = "t-watch-1337";
-static char s_symbols[STOCK_MAX_SYMBOLS][STOCK_SYMBOL_LEN];
-static int  s_symbol_count = 0;
+static char s_symbols[STOCK_MAX_SYMBOLS][STOCK_SYMBOL_LEN] = {
+    "AAPL", "MSFT", "SPY", "QQQ", ""
+};
+static int  s_symbol_count = 4;
 static bool s_allow_http = false;
 static StockQuote s_quotes[STOCK_MAX_SYMBOLS];
 static char s_last_status[80] = "Configure the Python bridge";
@@ -119,7 +121,7 @@ static void load_config()
     s_server_url[0] = '\0';
     s_auth_token[0] = '\0';
     copy_text(s_ca_file, sizeof(s_ca_file), "/Stocks/ca.pem");
-    copy_text(s_preset, sizeof(s_preset), "atlas_weekly");
+    copy_text(s_preset, sizeof(s_preset), "private_job");
     copy_text(s_device_name, sizeof(s_device_name), "t-watch-1337");
     s_allow_http = false;
     set_default_symbols();
@@ -336,7 +338,7 @@ static void stock_task(void *argument)
         int code = perform_http(*request, url, body, response, error, sizeof(error));
         if (code >= 200 && code < 300) {
             result->request_ok = true;
-            snprintf(result->status, sizeof(result->status), "Started preset: %.40s", request->preset);
+            copy_text(result->status, sizeof(result->status), "Started private job");
         } else {
             copy_text(result->status, sizeof(result->status), error);
         }
@@ -604,4 +606,39 @@ bool stock_screen_is_active()
 bool stock_screen_is_fetching()
 {
     return s_fetching;
+}
+
+static void rain_append(char *out, size_t out_size, size_t &used, const char *text)
+{
+    if (!text || out_size == 0) return;
+    for (const char *p = text; *p && used + 1 < out_size; ++p) {
+        const unsigned char ch = (unsigned char)*p;
+        // Keep the stream inside the Matrix font/recolor-safe alphabet. In
+        // particular, '#' is an LVGL recolor delimiter and must never enter.
+        if (isalnum(ch) || ch == '.' || ch == '+' || ch == '-' ||
+            ch == '%' || ch == '$' || ch == '>') {
+            out[used++] = (char)toupper(ch);
+        }
+    }
+    out[used] = '\0';
+}
+
+size_t stock_screen_build_rain_feed(char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+    size_t used = 0;
+
+    for (int i = 0; i < s_symbol_count && used + 1 < out_size; ++i) {
+        if (i) rain_append(out, out_size, used, ">");
+        const StockQuote &quote = s_quotes[i];
+        rain_append(out, out_size, used,
+                    quote.symbol[0] ? quote.symbol : s_symbols[i]);
+        if (quote.ok) {
+            rain_append(out, out_size, used, "$");
+            rain_append(out, out_size, used, quote.price);
+            rain_append(out, out_size, used, quote.pct);
+        }
+    }
+    return used;
 }

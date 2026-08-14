@@ -1,5 +1,7 @@
 #include "settings_screen.h"
 #include "usb_sd.h"
+#include "matrix_bg.h"
+#include "theme.h"
 #include <LilyGoLib.h>
 #include <SD.h>
 #include <time.h>
@@ -26,6 +28,7 @@ void clock_screen_set_motion_wake(bool enabled);
 void clock_screen_set_manual_override(bool on);
 void clock_screen_apply_manual_time(int year, int mon, int day, int hour, int min);
 void clock_screen_get_local_time(struct tm *out);
+void clock_screen_apply_theme();
 
 // Manual-time roller range: years selectable in the date picker.
 #define MANUAL_YEAR_BASE  2020
@@ -42,6 +45,10 @@ static lv_obj_t *hour_format_switch;
 static lv_obj_t *hour_format_val_label;
 static lv_obj_t *matrix_switch;
 static lv_obj_t *matrix_val_label;
+static lv_obj_t *stock_rain_switch;
+static lv_obj_t *stock_rain_val_label;
+static lv_obj_t *theme_switch;
+static lv_obj_t *theme_val_label;
 static lv_obj_t *dim_dropdown;
 static lv_obj_t *dim_brightness_slider;
 static lv_obj_t *dim_brightness_val_label;
@@ -187,6 +194,11 @@ static void settings_save_to_sd();
 static void on_face_changed(lv_event_t *e)
 {
     bool analog = lv_obj_has_state(face_switch, LV_STATE_CHECKED);
+    if (analog && lv_obj_has_state(matrix_switch, LV_STATE_CHECKED)) {
+        lv_obj_clear_state(matrix_switch, LV_STATE_CHECKED);
+        lv_label_set_text(matrix_val_label, "Off");
+        clock_screen_set_matrix(false);
+    }
     lv_label_set_text(face_val_label, analog ? "Analog" : "Digital");
     clock_screen_set_analog_face(analog);
     // 12h / AM-PM / Show-seconds rows are only relevant on the digital
@@ -208,6 +220,15 @@ static void on_matrix_changed(lv_event_t *e)
 {
     bool on = lv_obj_has_state(matrix_switch, LV_STATE_CHECKED);
     lv_label_set_text(matrix_val_label, on ? "On" : "Off");
+    if (on) {
+        lv_obj_clear_state(face_switch, LV_STATE_CHECKED);
+        lv_label_set_text(face_val_label, "Matrix");
+        clock_screen_set_analog_face(false);
+        apply_layout();
+    } else {
+        bool analog = lv_obj_has_state(face_switch, LV_STATE_CHECKED);
+        lv_label_set_text(face_val_label, analog ? "Analog" : "Digital");
+    }
     clock_screen_set_matrix(on);
     settings_save_to_sd();
 }
@@ -232,6 +253,23 @@ static void on_sleep_timeout_changed(lv_event_t *e)
 {
     uint32_t idx = lv_dropdown_get_selected(sleep_dropdown);
     clock_screen_set_sleep_timeout(SLEEP_TIMEOUT_MS[idx]);
+    settings_save_to_sd();
+}
+
+static void on_theme_changed(lv_event_t *)
+{
+    bool blue = lv_obj_has_state(theme_switch, LV_STATE_CHECKED);
+    lv_label_set_text(theme_val_label, blue ? "Blue" : "Green");
+    theme_set_blue(blue);
+    clock_screen_apply_theme();
+    settings_save_to_sd();
+}
+
+static void on_stock_rain_changed(lv_event_t *)
+{
+    bool on = lv_obj_has_state(stock_rain_switch, LV_STATE_CHECKED);
+    lv_label_set_text(stock_rain_val_label, on ? "On" : "Off");
+    matrix_bg_set_stock_data(on);
     settings_save_to_sd();
 }
 
@@ -271,8 +309,12 @@ static void on_dim_brightness_changed(lv_event_t *e)
 {
     s_dim_brightness = lv_slider_get_value(dim_brightness_slider);
     clock_screen_set_dim_brightness((uint8_t)s_dim_brightness);
-    int pct = (int)s_dim_brightness * 100 / (int)DEVICE_MAX_BRIGHTNESS_LEVEL;
-    lv_label_set_text_fmt(dim_brightness_val_label, "%d%%", pct);
+    if (s_dim_brightness == 0) {
+        lv_label_set_text(dim_brightness_val_label, "OFF");
+    } else {
+        int pct = (int)s_dim_brightness * 100 / (int)DEVICE_MAX_BRIGHTNESS_LEVEL;
+        lv_label_set_text_fmt(dim_brightness_val_label, "%d%%", pct);
+    }
     // No save here — a drag fires VALUE_CHANGED on every pixel.
     // The save runs once on LV_EVENT_RELEASED via on_slider_released.
 }
@@ -618,7 +660,7 @@ void settings_screen_create()
     lv_obj_t *mx_lbl = lv_label_create(matrix_row);
     lv_obj_set_style_text_color(mx_lbl, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
     lv_obj_set_style_text_font(mx_lbl, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_label_set_text(mx_lbl, "Matrix BG");
+    lv_label_set_text(mx_lbl, "Matrix Face");
     lv_obj_align(mx_lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     matrix_val_label = lv_label_create(matrix_row);
@@ -770,7 +812,8 @@ void settings_screen_create()
     lv_obj_set_style_text_color(dim_brightness_val_label, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(dim_brightness_val_label, &lv_font_montserrat_20, LV_PART_MAIN);
     int init_pct = (int)s_dim_brightness * 100 / (int)DEVICE_MAX_BRIGHTNESS_LEVEL;
-    lv_label_set_text_fmt(dim_brightness_val_label, "%d%%", init_pct);
+    if (s_dim_brightness == 0) lv_label_set_text(dim_brightness_val_label, "OFF");
+    else                       lv_label_set_text_fmt(dim_brightness_val_label, "%d%%", init_pct);
     lv_obj_align(dim_brightness_val_label, LV_ALIGN_RIGHT_MID, 0, 0);
 
     // Dimmed Brightness slider
@@ -778,7 +821,7 @@ void settings_screen_create()
     lv_obj_set_size(dim_brightness_slider, 320, 50);
     lv_obj_align(dim_brightness_slider, LV_ALIGN_TOP_MID, 0, 720);
     register_shiftable(dim_brightness_slider, 720);
-    lv_slider_set_range(dim_brightness_slider, 1, DEVICE_MAX_BRIGHTNESS_LEVEL);
+    lv_slider_set_range(dim_brightness_slider, 0, DEVICE_MAX_BRIGHTNESS_LEVEL);
     lv_slider_set_value(dim_brightness_slider, s_dim_brightness, LV_ANIM_OFF);
 
     lv_obj_set_style_bg_color(dim_brightness_slider, lv_color_make(0x44, 0x44, 0x44), LV_PART_MAIN);
@@ -1061,6 +1104,71 @@ void settings_screen_create()
     lv_obj_align(screenshot_hint, LV_ALIGN_TOP_MID, 0, 1430);
     register_shiftable(screenshot_hint, 1430);
 
+    // Accent palette. Checked selects blue; unchecked keeps the original
+    // green status icons, clock accents, and Matrix-rain gradient.
+    lv_obj_t *theme_row = lv_obj_create(settings_screen);
+    lv_obj_set_size(theme_row, 380, 40);
+    lv_obj_set_style_bg_opa(theme_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(theme_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(theme_row, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(theme_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(theme_row, LV_ALIGN_TOP_MID, 0, 1498);
+    register_shiftable(theme_row, 1498);
+
+    lv_obj_t *theme_lbl = lv_label_create(theme_row);
+    lv_obj_set_style_text_color(theme_lbl, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(theme_lbl, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(theme_lbl, "Accent Theme");
+    lv_obj_align(theme_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    theme_val_label = lv_label_create(theme_row);
+    lv_obj_set_style_text_color(theme_val_label, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(theme_val_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(theme_val_label, "Green");
+    lv_obj_align(theme_val_label, LV_ALIGN_RIGHT_MID, -80, 0);
+
+    theme_switch = lv_switch_create(theme_row);
+    lv_obj_set_size(theme_switch, 70, 34);
+    lv_obj_set_style_bg_color(theme_switch, lv_color_make(0x44, 0x44, 0x44), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(theme_switch, lv_color_make(0x33, 0x77, 0xFF), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(theme_switch, on_theme_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_align(theme_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    // Optional quote glyph source for Matrix mode. It is intentionally
+    // independent of the Matrix toggle so the preference is remembered when
+    // switching faces; the renderer consumes cached values only.
+    lv_obj_t *stock_rain_row = lv_obj_create(settings_screen);
+    lv_obj_set_size(stock_rain_row, 380, 40);
+    lv_obj_set_style_bg_opa(stock_rain_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(stock_rain_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(stock_rain_row, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(stock_rain_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(stock_rain_row, LV_ALIGN_TOP_MID, 0, 1546);
+    register_shiftable(stock_rain_row, 1546);
+
+    lv_obj_t *stock_rain_lbl = lv_label_create(stock_rain_row);
+    lv_obj_set_style_text_color(stock_rain_lbl, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(stock_rain_lbl, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(stock_rain_lbl, "Stock Data Rain");
+    lv_obj_align(stock_rain_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    stock_rain_val_label = lv_label_create(stock_rain_row);
+    lv_obj_set_style_text_color(stock_rain_val_label, lv_color_make(0xAA, 0xAA, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(stock_rain_val_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_label_set_text(stock_rain_val_label, "Off");
+    lv_obj_align(stock_rain_val_label, LV_ALIGN_RIGHT_MID, -80, 0);
+
+    stock_rain_switch = lv_switch_create(stock_rain_row);
+    lv_obj_set_size(stock_rain_switch, 70, 34);
+    lv_obj_set_style_bg_color(stock_rain_switch, lv_color_make(0x44, 0x44, 0x44), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stock_rain_switch, lv_color_make(0x00, 0x99, 0xCC), LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_add_event_cb(stock_rain_switch, on_stock_rain_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_align(stock_rain_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    // Screenshot and theme rows were registered after the earlier layout
+    // pass; include them in the initial manual-time collapse as well.
+    apply_layout();
+
     // Reflect the current SD state in the row's interactability + checked
     // state. Boot order matters here — instance.isCardReady() may flip
     // later, but settings_screen_apply_sd_state() is also called from
@@ -1119,6 +1227,8 @@ static void settings_save_to_sd()
     f.printf("show_ampm=%d\n",       lv_obj_has_state(ampm_switch,        LV_STATE_CHECKED) ? 1 : 0);
     f.printf("show_secs=%d\n",       lv_obj_has_state(secs_switch,        LV_STATE_CHECKED) ? 1 : 0);
     f.printf("matrix=%d\n",          lv_obj_has_state(matrix_switch,      LV_STATE_CHECKED) ? 1 : 0);
+    f.printf("stock_data_rain=%d\n",lv_obj_has_state(stock_rain_switch,  LV_STATE_CHECKED) ? 1 : 0);
+    f.printf("blue_theme=%d\n",      lv_obj_has_state(theme_switch,       LV_STATE_CHECKED) ? 1 : 0);
     f.printf("show_day=%d\n",        lv_obj_has_state(show_day_switch,    LV_STATE_CHECKED) ? 1 : 0);
     f.printf("show_date=%d\n",       lv_obj_has_state(show_date_switch,   LV_STATE_CHECKED) ? 1 : 0);
     f.printf("vibrate=%d\n",         lv_obj_has_state(vibrate_switch,     LV_STATE_CHECKED) ? 1 : 0);
@@ -1189,7 +1299,22 @@ void settings_screen_load()
         } else if (key == "matrix") {
             apply_switch(matrix_switch, b);
             lv_label_set_text(matrix_val_label, b ? "On" : "Off");
+            if (b) {
+                apply_switch(face_switch, false);
+                lv_label_set_text(face_val_label, "Matrix");
+                clock_screen_set_analog_face(false);
+                apply_layout();
+            }
             clock_screen_set_matrix(b);
+        } else if (key == "stock_data_rain") {
+            apply_switch(stock_rain_switch, b);
+            lv_label_set_text(stock_rain_val_label, b ? "On" : "Off");
+            matrix_bg_set_stock_data(b);
+        } else if (key == "blue_theme") {
+            apply_switch(theme_switch, b);
+            lv_label_set_text(theme_val_label, b ? "Blue" : "Green");
+            theme_set_blue(b);
+            clock_screen_apply_theme();
         } else if (key == "show_day") {
             apply_switch(show_day_switch, b);
             clock_screen_set_show_day(b);
@@ -1205,13 +1330,16 @@ void settings_screen_load()
             lv_dropdown_set_selected(dim_dropdown, idx);
             clock_screen_set_dim_timeout(DIM_TIMEOUT_MS[idx]);
         } else if (key == "dim_brightness") {
-            if (v < 1) v = 1;
+            if (v < 0) v = 0;
             if (v > DEVICE_MAX_BRIGHTNESS_LEVEL) v = DEVICE_MAX_BRIGHTNESS_LEVEL;
             s_dim_brightness = (int32_t)v;
             lv_slider_set_value(dim_brightness_slider, v, LV_ANIM_OFF);
             clock_screen_set_dim_brightness((uint8_t)v);
-            int pct = (int)v * 100 / (int)DEVICE_MAX_BRIGHTNESS_LEVEL;
-            lv_label_set_text_fmt(dim_brightness_val_label, "%d%%", pct);
+            if (v == 0) lv_label_set_text(dim_brightness_val_label, "OFF");
+            else {
+                int pct = (int)v * 100 / (int)DEVICE_MAX_BRIGHTNESS_LEVEL;
+                lv_label_set_text_fmt(dim_brightness_val_label, "%d%%", pct);
+            }
         } else if (key == "motion_wake") {
             apply_switch(motion_wake_switch, b);
             lv_label_set_text(motion_wake_val_label, b ? "On" : "Off");

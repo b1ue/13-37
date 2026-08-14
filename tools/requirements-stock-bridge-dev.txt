@@ -1,2 +1,2 @@
 -r requirements-stock-bridge.txt
-httpx>=0.28,<1
+httpx==0.28.1
