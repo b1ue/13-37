@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "allow_remote": false,
+  "port": 8737,
+  "auth_token_env": "STOCK_BRIDGE_TOKEN",
+  "alpha_vantage_api_key_env": "ALPHAVANTAGE_API_KEY",
+  "quote_cache_seconds": 300,
+  "snapshot_file": "../private-stock-output/watch_snapshot.json",
+  "one_job_at_a_time": true,
+  "expose_job_details": false,
+  "presets": {
+    "private_job": {
+      "cwd": "../private-stock-engine",
+      "command": ["python", "runner.py"]
+    }
+  }
+}

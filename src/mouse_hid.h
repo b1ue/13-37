@@ -16,8 +16,8 @@ enum {
 // callback slot and must be stopped first.
 bool mouse_hid_start();
 
-// Stop advertising and tear the BLE stack back down (controller memory is kept,
-// so the scanners can reclaim BLE afterwards).
+// Stop advertising, disconnect peers, remove GATT services, and tear the BLE
+// stack back down (controller memory is kept so scanners can reclaim it).
 void mouse_hid_stop();
 
 bool mouse_hid_is_running();      // BLE up (advertising or connected)

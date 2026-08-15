@@ -1,0 +1,20 @@
+{
+  "message": "Private workflow complete",
+  "quotes": {
+    "AAPL": {
+      "price": "232.10",
+      "change": "+1.24",
+      "pct": "+0.54%",
+      "stamp": "2026-08-13",
+      "spark": [225.2, 226.8, 228.1, 227.4, 230.0, 232.1]
+    }
+  },
+  "alerts": [
+    {
+      "id": "watch-aapl-20260813",
+      "severity": "info",
+      "title": "AAPL data updated",
+      "message": "See the private report."
+    }
+  ]
+}

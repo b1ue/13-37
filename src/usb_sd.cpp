@@ -1,4 +1,5 @@
 #include "usb_sd.h"
+#include "packet_capture.h"
 #include <Arduino.h>
 #include <SD.h>
 #include <LilyGoLib.h>
@@ -89,6 +90,9 @@ bool usb_sd_start()
 {
     if (!s_inited) return false;
     if (s_running) return true;
+
+    // Close any active PCAP before presenting the FAT volume to the host.
+    packet_capture_stop();
 
     // Re-read geometry in case the card was inserted after boot.
     uint32_t sectors = SD.numSectors();

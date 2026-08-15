@@ -202,11 +202,13 @@ static void refresh()
 
     if (s_strongest_rssi != -127) {
         lv_label_set_text_fmt(legend_label,
-            "strongest: %02X:%02X:%02X:%02X:%02X:%02X",
+            "strongest %02X:%02X:%02X:%02X:%02X:%02X\n"
+            "passive advertisements - devices expire after 10 s",
             s_strongest_bda[0], s_strongest_bda[1], s_strongest_bda[2],
             s_strongest_bda[3], s_strongest_bda[4], s_strongest_bda[5]);
     } else {
-        lv_label_set_text(legend_label, "");
+        lv_label_set_text(legend_label,
+            "passive advertisements - devices expire after 10 s");
     }
 }
 
@@ -258,6 +260,7 @@ void bt_analyze_screen_create()
     legend_label = lv_label_create(screen);
     lv_obj_set_style_text_color(legend_label, lv_color_make(0x88, 0x88, 0x88), LV_PART_MAIN);
     lv_obj_set_style_text_font(legend_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(legend_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_text(legend_label, "");
     lv_obj_align(legend_label, LV_ALIGN_TOP_MID, 0, 108);
 

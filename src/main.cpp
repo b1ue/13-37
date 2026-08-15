@@ -3,6 +3,7 @@
 #include <LV_Helper.h>
 #include <bosch/BoschSensorDataHelper.hpp>
 #include "esp_wifi.h"
+#include <WiFi.h>
 #include <time.h>
 #include <math.h>
 #include "gps_screen.h"
@@ -31,10 +32,18 @@
 #include "wifi_screen.h"
 #include "wifi_radio_screen.h"
 #include "bluetooth_screen.h"
+#include "stock_screen.h"
+#include "about_screen.h"
 #include "analyze_screen.h"
 #include "bt_analyze_screen.h"
 #include "lora_analyze_screen.h"
+#include "rolling_code.h"
+#include "rolling_code_screen.h"
+#include "packet_capture.h"
+#include "packet_screen.h"
+#include "text_editor_screen.h"
 #include "pingsweep.h"
+#include "hostresolve.h"
 #include "portscan.h"
 #include "portscan_screen.h"
 #include "wardriver_screen.h"
@@ -51,7 +60,11 @@
 #include "skimmer.h"
 #include "evil_twin.h"
 #include "flock.h"
+#include "mouse_hid.h"
+#include "ble_scan_manager.h"
+#include "wifi_beacon_manager.h"
 #include "matrix_bg.h"
+#include "theme.h"
 #include "nfc_icon.h"
 
 static lv_obj_t *clock_screen;
@@ -77,6 +90,7 @@ static lv_obj_t *hand_hour;
 static lv_obj_t *hand_min;
 static lv_obj_t *hand_sec;
 static bool      analog_face = false;
+static bool      matrix_face = false;
 static uint32_t last_update_ms   = 0;
 static int      clock_utc_offset = 0; // hours, set after GPS fix
 static bool     manual_time_override = false; // user-set time; blocks GPS sync
@@ -125,6 +139,8 @@ static lv_obj_t *evil_twin_count_label;
 // Flock/OUI surveillance-device indicator (left of AirTag indicator)
 static lv_obj_t *flock_indicator;
 static lv_obj_t *flock_count_label;
+static lv_obj_t *flock_alert_banner;
+static lv_timer_t *flock_alert_timer;
 
 // Battery body geometry (pixels)
 static constexpr int BAT_W      = 60;                       // halved from 120
@@ -303,9 +319,9 @@ static void update_lora_indicator()
     // the pager scanner, the TPMS scanner, APRS, or the LoRa analyzer.
     bool in_use = lora_screen_is_powered() || pager_is_running()
                || tpms_is_running() || aprs_is_running()
-               || lora_analyze_is_running();
+               || lora_analyze_is_running() || rolling_code_is_running();
     lv_color_t color = in_use
-        ? lv_color_make(0x00, 0xFF, 0x80)
+        ? theme_accent_bright()
         : lv_color_make(0x33, 0x33, 0x33);
     lv_obj_set_style_arc_color(lora_arc,  color, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(lora_ball,  color, LV_PART_MAIN);
@@ -385,7 +401,7 @@ static void update_bt_indicator()
 {
     bool on = btStarted();
     lv_color_t color = on
-        ? lv_color_make(0x00, 0xFF, 0x80)  // green — BT active
+        ? theme_accent_bright()             // themed — BT active
         : lv_color_make(0x33, 0x33, 0x33); // gray  — BT off
     lv_obj_set_style_text_color(bt_indicator, color, LV_PART_MAIN);
 }
@@ -396,7 +412,7 @@ static void update_wifi_indicator()
     esp_wifi_get_mode(&mode);
     bool on = (mode != WIFI_MODE_NULL);
     lv_color_t color = on
-        ? lv_color_make(0x00, 0xFF, 0x80)  // green — radio active
+        ? theme_accent_bright()             // themed — radio active
         : lv_color_make(0x33, 0x33, 0x33); // gray  — radio off
     lv_obj_set_style_text_color(wifi_indicator, color, LV_PART_MAIN);
 }
@@ -429,7 +445,7 @@ static void update_sd_indicator()
         }
     }
     lv_color_t color = sd_was_ready
-        ? lv_color_make(0x00, 0xFF, 0x80)  // green — card mounted
+        ? theme_accent_bright()             // themed — card mounted
         : lv_color_make(0x33, 0x33, 0x33); // gray  — no card
     lv_obj_set_style_text_color(sd_indicator, color, LV_PART_MAIN);
 
@@ -445,7 +461,7 @@ static void update_nfc_indicator()
 {
     bool on = instance.pmu.isEnableDLDO1();
     lv_color_t color = on
-        ? lv_color_make(0x00, 0xFF, 0x80)
+        ? theme_accent_bright()
         : lv_color_make(0x33, 0x33, 0x33);
     lv_obj_set_style_image_recolor(nfc_indicator, color, LV_PART_MAIN);
     lv_obj_set_style_image_recolor_opa(nfc_indicator, LV_OPA_COVER, LV_PART_MAIN);
@@ -590,7 +606,7 @@ static void update_wardriver_indicator()
 
     if (running) {
         lv_obj_set_style_text_color(wardriver_wifi_label,
-            lv_color_make(0x00, 0xFF, 0x80), LV_PART_MAIN);
+            theme_accent_bright(), LV_PART_MAIN);
         if (wc > 0)
             lv_label_set_text_fmt(wardriver_wifi_label, LV_SYMBOL_EYE_OPEN " %d", wc);
         else
@@ -758,7 +774,7 @@ void clock_screen_set_mesh_count(int count)
 void clock_screen_set_gps_active(bool active)
 {
     lv_color_t color = active
-        ? lv_color_make(0x00, 0xFF, 0x80)
+        ? theme_accent_bright()
         : lv_color_make(0x33, 0x33, 0x33);
     lv_obj_set_style_text_color(gps_indicator, color, LV_PART_MAIN);
     if (!active) {
@@ -816,14 +832,79 @@ void clock_screen_set_vibrate(bool enabled)
 // Called by settings screen to enable/disable the Matrix rain background
 void clock_screen_set_matrix(bool enabled)
 {
+    matrix_face = enabled;
     matrix_bg_set_enabled(enabled);
+    if (time_label) {
+        lv_color_t time_color = enabled
+            ? theme_accent_bright()
+            : lv_color_white();
+        lv_obj_set_style_text_color(time_label, time_color, LV_PART_MAIN);
+        lv_obj_set_style_text_color(date_label,
+            enabled ? theme_accent_mid()
+                    : lv_color_make(0xAA, 0xAA, 0xAA),
+            LV_PART_MAIN);
+        update_clock();
+    }
+}
+
+static void recolor_clock_icon(lv_obj_t *icon, lv_color_t color)
+{
+    if (!icon || lv_obj_get_child_count(icon) < 2) return;
+    lv_obj_t *cap = lv_obj_get_child(icon, 0);
+    lv_obj_t *ring = lv_obj_get_child(icon, 1);
+    lv_obj_set_style_bg_color(cap, color, LV_PART_MAIN);
+    lv_obj_set_style_border_color(ring, color, LV_PART_MAIN);
+    if (lv_obj_get_child_count(ring) > 0)
+        lv_obj_set_style_bg_color(lv_obj_get_child(ring, 0), color, LV_PART_MAIN);
+}
+
+void clock_screen_apply_theme()
+{
+    matrix_bg_refresh_theme();
+    clock_screen_set_matrix(matrix_face);
+    update_lora_indicator();
+    update_bt_indicator();
+    update_wifi_indicator();
+    update_sd_indicator();
+    update_nfc_indicator();
+    update_wardriver_indicator();
+    if (gps_indicator && gps_screen_is_powered())
+        lv_obj_set_style_text_color(gps_indicator, theme_accent_bright(), LV_PART_MAIN);
+    if (alarm_indicator)
+        lv_obj_set_style_text_color(alarm_indicator, theme_accent_mid(), LV_PART_MAIN);
+    recolor_clock_icon(stopwatch_indicator, theme_accent_mid());
+    recolor_clock_icon(timer_indicator, theme_accent_mid());
+    if (hand_sec) lv_obj_set_style_bg_color(hand_sec, theme_accent_mid(), LV_PART_MAIN);
 }
 
 // Dim timer state — updated by settings screen callbacks
 static uint32_t s_dim_timeout_ms   = 0;   // 0 = disabled
 static uint8_t  s_dim_brightness   = DEVICE_MAX_BRIGHTNESS_LEVEL / 4;
+static uint8_t  s_active_brightness = DEVICE_MAX_BRIGHTNESS_LEVEL;
+static uint32_t s_sleep_timeout_ms  = 30UL * 60UL * 1000UL; // idle deep-sleep default
+static bool     s_keep_awake_screen = true;
+static bool     s_keep_awake_wifi   = false;
+static bool     s_keep_awake_radios = true;
+static bool     s_keep_awake_tools  = true;
 static uint32_t s_last_activity_ms = 0;
 static bool     s_is_dimmed        = false;
+static bool     s_display_asleep   = false;
+
+static void wake_display_if_needed()
+{
+    if (!s_display_asleep) return;
+    instance.wakeupDisplay();
+    s_display_asleep = false;
+    matrix_bg_set_paused(false);
+}
+
+void clock_screen_set_brightness(uint8_t level)
+{
+    if (level < 1) level = 1;
+    s_active_brightness = level;
+    if (!s_is_dimmed && !s_display_asleep)
+        instance.setBrightness(s_active_brightness);
+}
 
 void clock_screen_set_dim_timeout(uint32_t ms)
 {
@@ -832,15 +913,19 @@ void clock_screen_set_dim_timeout(uint32_t ms)
     s_last_activity_ms = millis();
     if (s_is_dimmed) {
         s_is_dimmed = false;
-        instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
+        wake_display_if_needed();
+        instance.setBrightness(s_active_brightness);
     }
 }
 
 void clock_screen_set_dim_brightness(uint8_t level)
 {
     s_dim_brightness = level;
-    // If already dimmed, apply new level immediately
-    if (s_is_dimmed) instance.setBrightness(s_dim_brightness);
+    // If already dimmed, apply a non-zero level immediately. A zero value is
+    // applied by the idle timer, where it can enter true display sleep without
+    // blanking the panel while the user is still dragging the slider.
+    if (s_is_dimmed && s_dim_brightness > 0 && !s_display_asleep)
+        instance.setBrightness(s_dim_brightness);
 }
 
 static void dim_reset_activity()
@@ -848,9 +933,76 @@ static void dim_reset_activity()
     s_last_activity_ms = millis();
     if (s_is_dimmed) {
         s_is_dimmed = false;
-        instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
+        wake_display_if_needed();
+        instance.setBrightness(s_active_brightness);
     }
 }
+
+void clock_screen_set_sleep_timeout(uint32_t ms)
+{
+    s_sleep_timeout_ms = ms;
+    s_last_activity_ms = millis();
+}
+
+static void dismiss_flock_alert(lv_timer_t *)
+{
+    if (flock_alert_banner) {
+        lv_obj_del(flock_alert_banner);
+        flock_alert_banner = nullptr;
+    }
+    flock_alert_timer = nullptr;
+}
+
+void clock_screen_show_flock_alert(const char *vendor, const char *confidence,
+                                   int8_t rssi)
+{
+    dim_reset_activity();
+
+    if (flock_alert_timer) {
+        lv_timer_del(flock_alert_timer);
+        flock_alert_timer = nullptr;
+    }
+    if (flock_alert_banner) {
+        lv_obj_del(flock_alert_banner);
+        flock_alert_banner = nullptr;
+    }
+
+    lv_obj_t *active = lv_screen_active();
+    if (!active) return;
+    flock_alert_banner = lv_obj_create(active);
+    lv_obj_set_size(flock_alert_banner, 390, 76);
+    lv_obj_align(flock_alert_banner, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_set_style_bg_color(flock_alert_banner, lv_color_make(0x18, 0x0C, 0x00), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(flock_alert_banner, LV_OPA_90, LV_PART_MAIN);
+    lv_obj_set_style_border_color(flock_alert_banner, lv_color_make(0xFF, 0x88, 0x00), LV_PART_MAIN);
+    lv_obj_set_style_border_width(flock_alert_banner, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(flock_alert_banner, 10, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(flock_alert_banner, 6, LV_PART_MAIN);
+    lv_obj_clear_flag(flock_alert_banner, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(flock_alert_banner);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_make(0xFF, 0xAA, 0x22), LV_PART_MAIN);
+    lv_label_set_text(title, "PRIVACY DETECTOR");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *detail = lv_label_create(flock_alert_banner);
+    lv_obj_set_style_text_font(detail, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(detail, lv_color_white(), LV_PART_MAIN);
+    lv_label_set_text_fmt(detail, "%s | %s | %d dBm",
+                          vendor ? vendor : "Match",
+                          confidence ? confidence : "Unknown", (int)rssi);
+    lv_obj_align(detail, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_move_foreground(flock_alert_banner);
+
+    flock_alert_timer = lv_timer_create(dismiss_flock_alert, 5000, nullptr);
+    lv_timer_set_repeat_count(flock_alert_timer, 1);
+}
+
+void clock_screen_set_keep_awake_screen(bool enabled) { s_keep_awake_screen = enabled; }
+void clock_screen_set_keep_awake_wifi(bool enabled)   { s_keep_awake_wifi = enabled; }
+void clock_screen_set_keep_awake_radios(bool enabled) { s_keep_awake_radios = enabled; }
+void clock_screen_set_keep_awake_tools(bool enabled)  { s_keep_awake_tools = enabled; }
 
 // ---- Motion-wake ----------------------------------------------------------
 //
@@ -861,7 +1013,7 @@ static void dim_reset_activity()
 // settings can switch it off if the user wants the dim timer to run even
 // while the watch is being worn.
 static SensorXYZ s_motion_accel(SensorBHI260AP::ACCEL_PASSTHROUGH, instance.sensor);
-static bool      s_motion_wake_enabled    = true;
+static bool      s_motion_wake_enabled    = false;
 static bool      s_motion_accel_started   = false;
 static float     s_motion_last_mag        = 0.0f;
 // 10 Hz is enough to catch a wrist tilt without burning power; the BHI260
@@ -914,6 +1066,63 @@ static void motion_wake_poll()
     if (delta >= MOTION_DELTA_G) {
         dim_reset_activity();
     }
+}
+
+static bool idle_deep_sleep_allowed()
+{
+    // Alarms and timepieces are hard safety blockers: deep sleep would stop
+    // their software timers and cause the alert to be missed.
+    if (alarm_is_enabled() || alarm_is_ringing()) return false;
+    if (timer_is_running() || stopwatch_is_running()) return false;
+
+    if (s_keep_awake_screen && lv_screen_active() != clock_screen) return false;
+
+    if (s_keep_awake_wifi &&
+        (wifi_radio_screen_is_powered() || WiFi.status() == WL_CONNECTED ||
+         pingsweep_is_running() || portscan_is_running() ||
+         hostresolve_is_running() || stock_screen_is_fetching() ||
+         packet_capture_is_running() || packet_capture_is_starting())) return false;
+
+    if (s_keep_awake_radios &&
+        (gps_screen_is_powered() || nfc_screen_is_powered() ||
+         lora_screen_is_powered() || pager_is_running() || tpms_is_running() ||
+         aprs_is_running() || lora_analyze_is_running() || rolling_code_is_running() ||
+         meshtastic_is_active() ||
+         bluetooth_screen_is_powered() || ble_scan_active() ||
+         mouse_hid_is_running())) return false;
+
+    if (s_keep_awake_tools &&
+        (wardriver_is_running() || evil_twin_is_running() || flock_is_running() ||
+         airtag_is_running() || flipper_is_running() || skimmer_is_running() ||
+         wifi_beacon_active())) return false;
+
+    // Never unmount storage from a host computer automatically.
+    if (usb_sd_is_running()) return false;
+
+    return true;
+}
+
+static void enter_idle_deep_sleep()
+{
+    matrix_bg_set_paused(true);
+    instance.setBrightness(0);
+
+    // Wardriving owns an SD-backed capture table. Finish its queue and flush
+    // before LilyGoLib unmounts the card as part of the sleep sequence.
+    wardriver_prepare_for_sleep();
+    rolling_code_prepare_for_sleep();
+    flock_prepare_for_sleep();
+    packet_capture_prepare_for_sleep();
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+
+    // Use the board library's sleep path: it sleeps and ends the display,
+    // flushes/unmounts SD, disables measurement and peripheral rails, clears
+    // PMU IRQ state, resets bus pins, and configures both wake sources.
+    instance.sleep((WakeupSource_t)(WAKEUP_SRC_POWER_KEY | WAKEUP_SRC_BOOT_BUTTON),
+                   false, 0);
 }
 
 // Called by gps_screen after a quality fix to set the longitude-derived UTC offset
@@ -1145,8 +1354,11 @@ static void update_clock()
         // the string so the total width never changes and the digits stay put.
         static bool s_colon_on = true;
         if (!clock_show_secs) s_colon_on = !s_colon_on;
+        lv_color_t lit_colon = matrix_face
+            ? theme_accent_bright()
+            : lv_color_white();
         lv_style_set_text_color(&s_span_colon->style,
-                                (clock_show_secs || s_colon_on) ? lv_color_white() : lv_color_black());
+                                (clock_show_secs || s_colon_on) ? lit_colon : lv_color_black());
         lv_obj_invalidate(time_label);
         resize_clock_text();
     }
@@ -1551,6 +1763,9 @@ void setup()
     analyze_screen_create();
     bt_analyze_screen_create();
     lora_analyze_screen_create();
+    rolling_code_screen_create();
+    packet_screen_create();
+    text_editor_screen_create();
     stopwatch_screen_create();
     timer_screen_create();
     alarm_screen_create();
@@ -1623,12 +1838,10 @@ void setup()
     update_wardriver_indicator();
     instance.setBrightness(DEVICE_MAX_BRIGHTNESS_LEVEL);
 
-    // Bring the motion-wake accelerometer up to its default state before
-    // loading settings — settings_screen_load() will flip it off again if
-    // the user has it disabled in /Settings/settings.txt. Doing this here
-    // (rather than at the static-init / declaration site) means it happens
-    // after instance.begin() has finished bringing the BHI260 firmware up.
-    clock_screen_set_motion_wake(true);
+    // Motion-wake is convenient, but it can repeatedly brighten a worn watch
+    // while the user is not actively using it. Leave it off unless the saved
+    // settings turn it on.
+    clock_screen_set_motion_wake(false);
 
     // Restore persisted settings from the SD card (if mounted and file exists).
     // Called after the default setBrightness so a saved brightness wins.
@@ -1672,6 +1885,18 @@ void loop()
                 bluetooth_screen_show();
             } else if (bluetooth_screen_is_active()) {
                 wifi_radio_screen_show();
+            } else if (stock_screen_is_active()) {
+                tools_screen_show();
+            } else if (about_screen_is_active()) {
+                tools_screen_show();
+            } else if (rolling_code_screen_is_active()) {
+                rolling_code_screen_stop();
+                tools_screen_show();
+            } else if (packet_screen_is_active()) {
+                packet_screen_stop();
+                tools_screen_show();
+            } else if (text_editor_screen_is_active()) {
+                tools_screen_show();
             } else if (wifi_radio_screen_is_active()) {
                 lora_screen_show();
             } else if (lora_screen_is_active()) {
@@ -1714,7 +1939,7 @@ void loop()
 
     // Feed NMEA bytes to TinyGPSPlus while the GPS radio is on
     if (gps_screen_is_powered()) {
-        instance.gps.loop(false);
+        gps_screen_poll();
     }
 
     // When a screen transition was just requested, skip all the heavy
@@ -1736,7 +1961,7 @@ void loop()
         if (lvgl_priority && !s_matrix_paused_by_us) {
             matrix_bg_set_paused(true);
             s_matrix_paused_by_us = true;
-        } else if (!lvgl_priority && s_matrix_paused_by_us) {
+        } else if (!lvgl_priority && s_matrix_paused_by_us && !s_display_asleep) {
             matrix_bg_set_paused(false);
             s_matrix_paused_by_us = false;
         }
@@ -1753,8 +1978,14 @@ void loop()
             flipper_bg_tick();
             skimmer_bg_tick();
             evil_twin_bg_tick();
-            flock_bg_tick();
         }
+        // Flock lifecycle stages and BLE controller teardown must continue
+        // even while USB owns the SD card; flock_bg_tick self-gates logging.
+        flock_bg_tick();
+        ble_scan_tick();
+        // The capture service self-stops if USB mass storage takes ownership
+        // of the card, so it must receive this tick even in that transition.
+        packet_capture_tick();
     }
     // Yield to LVGL between SD-heavy batches. The display uses partial
     // refresh with ~6 tiles per screen, one tile per lv_task_handler call;
@@ -1766,6 +1997,7 @@ void loop()
         tpms_bg_tick();
         pager_bg_tick();
         aprs_bg_tick();   // RX drain + queued TX; SD logging self-gates on USB SD
+        rolling_code_worker(); // receive-only pulse captures; one queued frame per loop
         pingsweep_poll(); // writes /PingSweeps/ once a sweep finishes
         portscan_poll();  // writes /PingSweeps/portscan_* once a scan finishes
         nfc_screen_worker();
@@ -1796,8 +2028,20 @@ void loop()
     if (s_dim_timeout_ms > 0 && !s_is_dimmed) {
         if (millis() - s_last_activity_ms >= s_dim_timeout_ms) {
             s_is_dimmed = true;
-            instance.setBrightness(s_dim_brightness);
+            if (s_dim_brightness == 0) {
+                matrix_bg_set_paused(true);
+                instance.setBrightness(0);
+                instance.sleepDisplay();
+                s_display_asleep = true;
+            } else {
+                instance.setBrightness(s_dim_brightness);
+            }
         }
+    }
+    if (s_sleep_timeout_ms > 0 &&
+        millis() - s_last_activity_ms >= s_sleep_timeout_ms &&
+        idle_deep_sleep_allowed()) {
+        enter_idle_deep_sleep();
     }
 
     // 1Hz block also skipped during LVGL priority window - it contains
@@ -1824,6 +2068,14 @@ void loop()
             wardriver_screen_update();
         if (configuration_screen_is_active())
             configuration_screen_update();
+    }
+    // Once the panel is truly asleep, two LVGL service passes earlier in this
+    // loop are enough to keep touch wake responsive. Avoid three extra redraw
+    // passes and yield the CPU for 20 ms; radio callbacks continue on their
+    // own tasks and main-loop queues are still drained about 50 times/second.
+    if (s_display_asleep) {
+        delay(20);
+        return;
     }
     // Multiple LVGL passes per loop iteration. Each lv_task_handler call
     // renders at most one partial-refresh tile, and the watch panel needs

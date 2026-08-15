@@ -82,9 +82,17 @@ static lv_obj_t *val_gps_time;
 static lv_obj_t *val_altitude;
 static lv_obj_t *val_speed;
 static lv_obj_t *val_fix_age;
+static lv_obj_t *val_nmea_chars;
+static lv_obj_t *val_checksums;
+static lv_obj_t *val_last_data;
 
 static bool gps_powered = false;
 static bool rtc_synced  = false; // reset each GPS power cycle
+static bool recovery_attempted = false;
+static uint32_t gps_power_on_ms = 0;
+static uint32_t last_nmea_ms = 0;
+static uint32_t chars_at_power_on = 0;
+static const uint32_t GPS_BOOT_GRACE_MS = 8000;
 
 // TinyGPSPlus has no reset; after a power cycle it keeps the previous session's
 // values with isValid()==true until fresh NMEA overwrites them (a cold restart
@@ -101,7 +109,32 @@ static bool gps_fresh(const T &elem)
 
 static void update_status()
 {
-    lv_label_set_text(status_label, gps_powered ? "Radio: ON" : "Radio: OFF");
+    if (!gps_powered) {
+        lv_label_set_text(status_label, "GPS: OFF");
+        lv_obj_set_style_text_color(status_label, lv_color_make(0x88, 0x88, 0x88), LV_PART_MAIN);
+        return;
+    }
+
+    uint32_t now = millis();
+    uint32_t chars = instance.gps.charsProcessed();
+    if (now - gps_power_on_ms < 2000) {
+        lv_label_set_text(status_label, "GPS: STARTING");
+        lv_obj_set_style_text_color(status_label, lv_color_make(0xFF, 0xCC, 0x00), LV_PART_MAIN);
+    } else if (chars == chars_at_power_on || now - last_nmea_ms > GPS_BOOT_GRACE_MS) {
+        lv_label_set_text(status_label,
+            recovery_attempted ? "GPS: NO NMEA" : "GPS: WAITING FOR NMEA");
+        lv_obj_set_style_text_color(status_label, lv_color_make(0xFF, 0x88, 0x33), LV_PART_MAIN);
+    } else if (gps_screen_has_lock()) {
+        lv_label_set_text_fmt(status_label, "GPS: FIX - %lu SATS",
+            (unsigned long)instance.gps.satellites.value());
+        lv_obj_set_style_text_color(status_label, lv_color_make(0x00, 0xCC, 0x66), LV_PART_MAIN);
+    } else {
+        uint32_t sats = gps_fresh(instance.gps.satellites)
+                      ? instance.gps.satellites.value() : 0;
+        lv_label_set_text_fmt(status_label, "GPS: ACQUIRING - %lu SATS",
+            (unsigned long)sats);
+        lv_obj_set_style_text_color(status_label, lv_color_make(0xFF, 0xCC, 0x00), LV_PART_MAIN);
+    }
 }
 
 static void on_toggle(lv_event_t *e)
@@ -114,6 +147,10 @@ static void on_toggle(lv_event_t *e)
     if (gps_powered) {
         Serial1.end();
         instance.powerControl(POWER_GPS, true);  // enableBLDO1 + Serial1.begin
+        gps_power_on_ms = millis();
+        last_nmea_ms = gps_power_on_ms;
+        chars_at_power_on = instance.gps.charsProcessed();
+        recovery_attempted = false;
     } else {
         instance.powerControl(POWER_GPS, false); // disableBLDO1 + reset pins
         Serial1.end();
@@ -122,6 +159,33 @@ static void on_toggle(lv_event_t *e)
     if (!gps_powered)
         rtc_synced = false; // allow re-sync on next power-on
     update_status();
+}
+
+void gps_screen_poll()
+{
+    if (!gps_powered) return;
+
+    uint32_t before = instance.gps.charsProcessed();
+    instance.gps.loop(false);
+    uint32_t after = instance.gps.charsProcessed();
+    uint32_t now = millis();
+    if (after != before) last_nmea_ms = now;
+
+    // A powered receiver emits NMEA before it has a fix. If the UART is
+    // completely silent after boot, retry the rail/UART sequence once. Never
+    // repeat the cold start, because that would prevent a difficult sky-view
+    // acquisition from ever completing.
+    if (!recovery_attempted && now - gps_power_on_ms >= GPS_BOOT_GRACE_MS &&
+        after == chars_at_power_on) {
+        recovery_attempted = true;
+        instance.powerControl(POWER_GPS, false);
+        Serial1.end();
+        delay(40);
+        instance.powerControl(POWER_GPS, true);
+        gps_power_on_ms = millis();
+        last_nmea_ms = gps_power_on_ms;
+        chars_at_power_on = instance.gps.charsProcessed();
+    }
 }
 
 // Creates one key/value row in the scrollable data panel.
@@ -176,6 +240,9 @@ static void on_gps_update(lv_timer_t *timer)
             lv_label_set_text(val_altitude,   "--");
             lv_label_set_text(val_speed,      "--");
             lv_label_set_text(val_fix_age,    "--");
+            lv_label_set_text(val_nmea_chars, "--");
+            lv_label_set_text(val_checksums,  "--");
+            lv_label_set_text(val_last_data,  "--");
         }
         return;
     }
@@ -247,6 +314,8 @@ static void on_gps_update(lv_timer_t *timer)
     // isn't looking at this screen.
     if (!screen_active) return;
 
+    update_status();
+
     lv_label_set_text(val_satellites, buf);
 
     // Location-derived fields (lat, lng, fix age share the same validity flag)
@@ -292,6 +361,19 @@ static void on_gps_update(lv_timer_t *timer)
     else
         strcpy(buf, "--");
     lv_label_set_text(val_speed, buf);
+
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)instance.gps.charsProcessed());
+    lv_label_set_text(val_nmea_chars, buf);
+    snprintf(buf, sizeof(buf), "%lu ok / %lu bad",
+        (unsigned long)instance.gps.passedChecksum(),
+        (unsigned long)instance.gps.failedChecksum());
+    lv_label_set_text(val_checksums, buf);
+    if (instance.gps.charsProcessed() == chars_at_power_on) {
+        lv_label_set_text(val_last_data, "none");
+    } else {
+        snprintf(buf, sizeof(buf), "%lu ms ago", (unsigned long)(millis() - last_nmea_ms));
+        lv_label_set_text(val_last_data, buf);
+    }
 }
 
 void gps_screen_create()
@@ -346,6 +428,9 @@ void gps_screen_create()
     make_data_row(data_panel, "Altitude",   &val_altitude);
     make_data_row(data_panel, "Speed",      &val_speed);
     make_data_row(data_panel, "Fix Age",    &val_fix_age);
+    make_data_row(data_panel, "NMEA Chars", &val_nmea_chars);
+    make_data_row(data_panel, "Checksums",  &val_checksums);
+    make_data_row(data_panel, "Last Data",  &val_last_data);
 
     lv_timer_create(on_gps_update, 1000, NULL);
 }

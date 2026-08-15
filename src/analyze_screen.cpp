@@ -204,7 +204,8 @@ static void refresh()
     float qp = s_chan[0].pps;
     for (int i = 1; i < N_CHANNELS; i++) if (s_chan[i].pps < qp) { qp = s_chan[i].pps; quietest = i; }
     lv_label_set_text_fmt(legend_label,
-        "quiet: ch %d (%.0f pkt/s)   busiest: ch %d (%.0f pkt/s)",
+        "quiet ch %d: %.0f/s   busy ch %d: %.0f/s\n"
+        "passive all-frame sample - 150 ms/channel",
         quietest + 1, qp, best_ch, best_pps < 0 ? 0 : best_pps);
 }
 
@@ -252,6 +253,7 @@ void analyze_screen_create()
     legend_label = lv_label_create(screen);
     lv_obj_set_style_text_color(legend_label, lv_color_make(0x88, 0x88, 0x88), LV_PART_MAIN);
     lv_obj_set_style_text_font(legend_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(legend_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_text(legend_label, "");
     lv_obj_align(legend_label, LV_ALIGN_TOP_MID, 0, 108);
 

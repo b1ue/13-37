@@ -306,7 +306,7 @@ static void update_legend()
 {
     if (!s_running) { lv_label_set_text(legend_label, ""); return; }
     lv_label_set_text_fmt(legend_label,
-        "current %g MHz   bin %d/%d",
+        "current %g MHz   bin %d/%d\n30 ms/bin - 500 kHz receive bandwidth",
         (double)freq_of_bin(s_band, s_cur_bin),
         s_cur_bin + 1, N_BINS);
 }
@@ -402,6 +402,7 @@ void lora_analyze_screen_create()
     legend_label = lv_label_create(screen);
     lv_obj_set_style_text_color(legend_label, lv_color_make(0x88, 0x88, 0x88), LV_PART_MAIN);
     lv_obj_set_style_text_font(legend_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(legend_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_text(legend_label, "");
     lv_obj_align(legend_label, LV_ALIGN_TOP_MID, 0, 108);
 

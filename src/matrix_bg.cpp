@@ -1,4 +1,6 @@
 #include "matrix_bg.h"
+#include "stock_screen.h"
+#include "theme.h"
 #include <esp_system.h>   // esp_random
 #include <stdio.h>
 
@@ -11,6 +13,10 @@ static lv_obj_t  *mx_cont = nullptr;
 static lv_obj_t  *mx_col[MX_COLS];
 static lv_timer_t *mx_timer = nullptr;
 static bool       mx_enabled = false;
+static bool       mx_stock_data = false;
+static char       mx_stock_feed[192];
+static size_t     mx_stock_feed_len = 0;
+static uint8_t    mx_stock_refresh_ticks = 0;
 
 static int  head[MX_COLS];          // current head row; negative = still entering
 static int  tlen[MX_COLS];          // trail length
@@ -39,6 +45,20 @@ static const char *MX_EGGS[] = {
 static const int MX_EGG_COUNT = sizeof(MX_EGGS) / sizeof(MX_EGGS[0]);
 
 static char rnd_char() { return MX_CHARSET[esp_random() % MX_CHARSET_LEN]; }
+
+static void refresh_stock_feed()
+{
+    mx_stock_feed_len = mx_stock_data
+        ? stock_screen_build_rain_feed(mx_stock_feed, sizeof(mx_stock_feed)) : 0;
+}
+
+static char displayed_glyph(int c, int r)
+{
+    if (!mx_stock_data || mx_stock_feed_len == 0) return cell[c][r];
+    // A relatively-prime column stride prevents adjacent trails from showing
+    // the same slice. The normal falling head/trail controls movement/shading.
+    return mx_stock_feed[((size_t)c * 17U + (size_t)r) % mx_stock_feed_len];
+}
 
 static void col_reset(int c)
 {
@@ -69,6 +89,12 @@ static void col_reset(int c)
 // Distance 0 = bright head, increasing distance = dimmer trail.
 static const char *shade(int dist, int len)
 {
+    if (theme_is_blue()) {
+        if (dist == 0)        return "D6EEFF";
+        if (dist <= len / 4)  return "66BBFF";
+        if (dist <= len / 2)  return "2277DD";
+        return "103B77";
+    }
     if (dist == 0)        return "CCFFCC";
     if (dist <= len / 4)  return "5BFF8C";
     if (dist <= len / 2)  return "22BB44";
@@ -78,13 +104,21 @@ static const char *shade(int dist, int len)
 static void render_col(int c)
 {
     char buf[MX_ROWS * 12];
-    int  n = 0;
+    size_t n = 0;
     for (int r = 0; r < MX_ROWS; r++) {
         int dist = head[c] - r;   // 0 at head, grows up the trail
         if (head[c] >= 0 && r <= head[c] && dist < tlen[c]) {
-            n += snprintf(buf + n, sizeof(buf) - n,
-                          "#%s %c#\n", shade(dist, tlen[c]), cell[c][r]);
+            const size_t remaining = sizeof(buf) - n;
+            const int written = snprintf(buf + n, remaining,
+                                         "#%s %c#\n", shade(dist, tlen[c]), displayed_glyph(c, r));
+            if (written < 0) break;
+            if (static_cast<size_t>(written) >= remaining) {
+                n = sizeof(buf) - 1;
+                break;
+            }
+            n += static_cast<size_t>(written);
         } else {
+            if (n == sizeof(buf) - 1) break;
             buf[n++] = '\n';      // empty row keeps vertical alignment
         }
     }
@@ -95,6 +129,12 @@ static void render_col(int c)
 
 static void mx_tick(lv_timer_t *)
 {
+    // Quote data is updated on the LVGL thread too. Refreshing this small
+    // local stream every ~3 seconds picks it up without locking or doing I/O.
+    if (mx_stock_data && ++mx_stock_refresh_ticks >= 25) {
+        mx_stock_refresh_ticks = 0;
+        refresh_stock_feed();
+    }
     for (int c = 0; c < MX_COLS; c++) {
         head[c]++;
         int el = egg_len[c];
@@ -155,9 +195,26 @@ void matrix_bg_set_enabled(bool en)
 
 bool matrix_bg_is_enabled() { return mx_enabled; }
 
+void matrix_bg_set_stock_data(bool enabled)
+{
+    mx_stock_data = enabled;
+    mx_stock_refresh_ticks = 0;
+    refresh_stock_feed();
+    if (!mx_cont || !mx_enabled) return;
+    for (int c = 0; c < MX_COLS; ++c) render_col(c);
+}
+
+bool matrix_bg_stock_data_enabled() { return mx_stock_data; }
+
 void matrix_bg_set_paused(bool paused)
 {
     if (!mx_timer) return;
     if (paused) lv_timer_pause(mx_timer);
     else        lv_timer_resume(mx_timer);
+}
+
+void matrix_bg_refresh_theme()
+{
+    if (!mx_cont || !mx_enabled) return;
+    for (int c = 0; c < MX_COLS; c++) render_col(c);
 }

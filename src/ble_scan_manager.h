@@ -1,33 +1,25 @@
 #pragma once
 #include "esp_gap_ble_api.h"
 
-// Multi-consumer wrapper around the ESP-IDF BLE scan API.
-//
-// The ESP32 BT controller exposes a single GAP callback slot — the last call
-// to esp_ble_gap_register_callback() wins. This module owns that single slot
-// and dispatches each scan-result event to every registered consumer, so the
-// wardriver and AirTag sniffer (and future features) can scan in parallel
-// without trampling each other.
-//
-// The BT controller and Bluedroid stack are brought up on the first add and
-// torn down on the last remove (reference-counted). Consumers are only called
-// for actual inquiry-response scan results (ESP_GAP_SEARCH_INQ_RES_EVT) — the
-// manager handles the SCAN_PARAM_SET_COMPLETE → start_scanning hand-off.
+// Multi-consumer wrapper around the ESP-IDF BLE scan API. The controller has
+// one GAP callback slot, so this manager owns it and fans inquiry results out
+// to registered scanners without callbacks replacing each other.
 
 typedef void (*ble_scan_cb_t)(esp_ble_gap_cb_param_t *param);
 
-// Register a consumer. Idempotent — calling twice with the same cb is a no-op.
-// Returns false if the controller fails to come up on the first add or the
-// consumer table is full (capacity 4 — raise BLE_SCAN_MAX_CONSUMERS if needed).
+// Register a consumer. Idempotent for an existing callback. Returns false if
+// controller startup fails or the six-entry consumer table is full.
 bool ble_scan_add(ble_scan_cb_t cb);
 
-// Unregister a consumer. The controller is torn down when the last consumer
-// is removed.
+// Unregister a consumer. Final controller shutdown is deliberately deferred
+// so this is always safe to call from an LVGL event callback.
 void ble_scan_remove(ble_scan_cb_t cb);
 
-// True if at least one consumer is registered.
-bool ble_scan_active();
+// Progress asynchronous scan stop and controller teardown. Call frequently
+// from the main loop; each call performs at most one lifecycle operation.
+void ble_scan_tick();
 
-// How many consumers are currently registered. Useful for status UIs
-// that want to surface "N scanners running" instead of just on/off.
+// True while consumers exist or final controller teardown is still pending.
+// This keeps exclusive BLE users (notably HID) out of the handoff window.
+bool ble_scan_active();
 int  ble_scan_consumer_count();
