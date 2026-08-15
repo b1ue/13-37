@@ -19,7 +19,8 @@ static void refresh_ui()
         LV_PART_MAIN);
 
     if (!running && rolling_code_last_error() != 0) {
-        lv_label_set_text_fmt(s_status, "Radio unavailable (%d)",
+        lv_label_set_text_fmt(s_status, "%s (%d)",
+                              rolling_code_last_error_text(),
                               (int)rolling_code_last_error());
         lv_obj_set_style_text_color(s_status, lv_color_make(0xFF, 0x88, 0x44), LV_PART_MAIN);
     } else {
@@ -33,7 +34,8 @@ static void refresh_ui()
 
     lv_label_set_text_fmt(s_details,
         "%s\n\nCaptures: %lu   Unique: %lu\nRepeats: %lu   Changed: %lu\n\n"
-        "Last signature: %08lX\nPulses: %u   Base: %u us\nDelta: %u%%   Peak: %d dBm\n\n"
+        "Last signature: %08lX\nPulses: %u   Base: %u us\nDelta: %u%%   Peak: %d dBm\n"
+        "Stack headroom: %lu bytes\n\n"
         "A candidate means similarly timed frames changed across button presses. "
         "It does not decrypt or authenticate the protocol.\n\nLog: %s",
         rolling_code_last_verdict(),
@@ -46,6 +48,7 @@ static void refresh_ui()
         (unsigned)rolling_code_last_base_us(),
         (unsigned)rolling_code_last_delta_percent(),
         (int)rolling_code_last_peak_rssi(),
+        (unsigned long)rolling_code_stack_headroom(),
         rolling_code_last_log_path()[0] ? rolling_code_last_log_path() : "SD log starts after capture");
 }
 

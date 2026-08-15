@@ -39,6 +39,9 @@
 #include "lora_analyze_screen.h"
 #include "rolling_code.h"
 #include "rolling_code_screen.h"
+#include "packet_capture.h"
+#include "packet_screen.h"
+#include "text_editor_screen.h"
 #include "pingsweep.h"
 #include "hostresolve.h"
 #include "portscan.h"
@@ -1077,7 +1080,8 @@ static bool idle_deep_sleep_allowed()
     if (s_keep_awake_wifi &&
         (wifi_radio_screen_is_powered() || WiFi.status() == WL_CONNECTED ||
          pingsweep_is_running() || portscan_is_running() ||
-         hostresolve_is_running() || stock_screen_is_fetching())) return false;
+         hostresolve_is_running() || stock_screen_is_fetching() ||
+         packet_capture_is_running() || packet_capture_is_starting())) return false;
 
     if (s_keep_awake_radios &&
         (gps_screen_is_powered() || nfc_screen_is_powered() ||
@@ -1107,6 +1111,8 @@ static void enter_idle_deep_sleep()
     // before LilyGoLib unmounts the card as part of the sleep sequence.
     wardriver_prepare_for_sleep();
     rolling_code_prepare_for_sleep();
+    flock_prepare_for_sleep();
+    packet_capture_prepare_for_sleep();
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -1758,6 +1764,8 @@ void setup()
     bt_analyze_screen_create();
     lora_analyze_screen_create();
     rolling_code_screen_create();
+    packet_screen_create();
+    text_editor_screen_create();
     stopwatch_screen_create();
     timer_screen_create();
     alarm_screen_create();
@@ -1884,6 +1892,11 @@ void loop()
             } else if (rolling_code_screen_is_active()) {
                 rolling_code_screen_stop();
                 tools_screen_show();
+            } else if (packet_screen_is_active()) {
+                packet_screen_stop();
+                tools_screen_show();
+            } else if (text_editor_screen_is_active()) {
+                tools_screen_show();
             } else if (wifi_radio_screen_is_active()) {
                 lora_screen_show();
             } else if (lora_screen_is_active()) {
@@ -1965,8 +1978,14 @@ void loop()
             flipper_bg_tick();
             skimmer_bg_tick();
             evil_twin_bg_tick();
-            flock_bg_tick();
         }
+        // Flock lifecycle stages and BLE controller teardown must continue
+        // even while USB owns the SD card; flock_bg_tick self-gates logging.
+        flock_bg_tick();
+        ble_scan_tick();
+        // The capture service self-stops if USB mass storage takes ownership
+        // of the card, so it must receive this tick even in that transition.
+        packet_capture_tick();
     }
     // Yield to LVGL between SD-heavy batches. The display uses partial
     // refresh with ~6 tiles per screen, one tile per lv_task_handler call;
@@ -2049,6 +2068,14 @@ void loop()
             wardriver_screen_update();
         if (configuration_screen_is_active())
             configuration_screen_update();
+    }
+    // Once the panel is truly asleep, two LVGL service passes earlier in this
+    // loop are enough to keep touch wake responsive. Avoid three extra redraw
+    // passes and yield the CPU for 20 ms; radio callbacks continue on their
+    // own tasks and main-loop queues are still drained about 50 times/second.
+    if (s_display_asleep) {
+        delay(20);
+        return;
     }
     // Multiple LVGL passes per loop iteration. Each lv_task_handler call
     // renders at most one partial-refresh tile, and the watch panel needs

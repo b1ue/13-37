@@ -15,6 +15,8 @@
 #include "analyze_screen.h"
 #include "about_screen.h"
 #include "rolling_code_screen.h"
+#include "packet_screen.h"
+#include "text_editor_screen.h"
 #include "theme.h"
 #include <LilyGoLib.h>
 
@@ -115,23 +117,30 @@ static void on_eviltwin_clicked(lv_event_t *e)
     }
 }
 
-static void set_flock_tile_running(bool running)
+static void refresh_flock_tile()
 {
+    bool running = flock_is_running();
     lv_obj_set_style_bg_color(t_flock,
-        running ? theme_accent_dark()
+        (flock_is_starting() || flock_is_stopping())
+                ? lv_color_make(0x55, 0x44, 0x11)
+                : running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
+}
+
+static void on_tools_status_timer(lv_timer_t *)
+{
+    if (lv_screen_active() == tools_screen) refresh_flock_tile();
 }
 
 static void on_flock_clicked(lv_event_t *e)
 {
     if (flock_is_running()) {
         flock_stop();
-        set_flock_tile_running(false);
-    } else {
-        bool ok = flock_start();
-        set_flock_tile_running(ok);
+    } else if (!flock_is_stopping()) {
+        flock_start();
     }
+    refresh_flock_tile();
 }
 
 // Tile container — 180x180 button-like card with a label at the bottom.
@@ -946,6 +955,47 @@ static void draw_rolling_rx_icon(lv_obj_t *tile)
     lv_obj_align(rx, LV_ALIGN_TOP_MID, 0, 33);
 }
 
+// Packet Lab - a small activity trace over a hexadecimal frame header.
+static void draw_packet_icon(lv_obj_t *tile)
+{
+    lv_obj_t *trace = lv_label_create(tile);
+    lv_obj_set_style_text_font(trace, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(trace, lv_color_make(0x33, 0xBB, 0xFF), LV_PART_MAIN);
+    lv_label_set_text(trace, "_|^^|_|^|_");
+    lv_obj_align(trace, LV_ALIGN_TOP_MID, 0, 30);
+
+    lv_obj_t *hex = lv_label_create(tile);
+    lv_obj_set_style_text_font(hex, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hex, lv_color_make(0x66, 0xCC, 0x99), LV_PART_MAIN);
+    lv_obj_set_style_text_align(hex, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_text(hex, "80 00 FF FF\n3A 01 10 9A");
+    lv_obj_align(hex, LV_ALIGN_TOP_MID, 0, 73);
+}
+
+// Text Editor - outlined note page with three green text strokes.
+static void draw_editor_icon(lv_obj_t *tile)
+{
+    lv_obj_t *page = lv_obj_create(tile);
+    lv_obj_set_size(page, 88, 96);
+    lv_obj_align(page, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_set_style_bg_color(page, lv_color_make(0x18, 0x18, 0x18), LV_PART_MAIN);
+    lv_obj_set_style_border_color(page, lv_color_make(0x88, 0x88, 0x88), LV_PART_MAIN);
+    lv_obj_set_style_border_width(page, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(page, 5, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(page, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 3; ++i) {
+        lv_obj_t *line = lv_obj_create(page);
+        lv_obj_set_size(line, i == 2 ? 44 : 62, 4);
+        lv_obj_set_pos(line, 12, 22 + i * 20);
+        lv_obj_set_style_bg_color(line, theme_accent_bright(), LV_PART_MAIN);
+        lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(line, 2, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(line, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
+
 static void draw_about_icon(lv_obj_t *tile)
 {
     lv_obj_t *disc = lv_obj_create(tile);
@@ -1008,6 +1058,7 @@ void tools_screen_create()
     //   [Stocks]    [AirTag]
     //   [Flipper]   [Skimmers]
     //   [Evil Twin] [Flock]
+    //   [Packets]    [Editor]
     //   [Rolling RX] [About]
     // The timepiece tiles (Alarm / Stopwatch / Timer / Calendar) used to live
     // at the bottom of this grid; they moved to the TIME screen (swipe up
@@ -1026,6 +1077,8 @@ void tools_screen_create()
     t_skimmer           = make_tile(grid, "Skimmers");
     t_eviltwin          = make_tile(grid, "Evil Twin");
     t_flock             = make_tile(grid, "Flock");
+    lv_obj_t *t_packets = make_tile(grid, "Packets");
+    lv_obj_t *t_editor  = make_tile(grid, "Editor");
     lv_obj_t *t_rolling = make_tile(grid, "Rolling RX");
     lv_obj_t *t_about   = make_tile(grid, "About");
 
@@ -1043,6 +1096,8 @@ void tools_screen_create()
     draw_skimmer_icon(t_skimmer);
     draw_eviltwin_icon(t_eviltwin);
     draw_flock_icon(t_flock);
+    draw_packet_icon(t_packets);
+    draw_editor_icon(t_editor);
     draw_rolling_rx_icon(t_rolling);
     draw_about_icon(t_about);
 
@@ -1073,11 +1128,17 @@ void tools_screen_create()
 
     // Flock tile toggles the surveillance-vendor detector (WiFi + BLE scan).
     lv_obj_add_event_cb(t_flock, on_flock_clicked, LV_EVENT_CLICKED, NULL);
-    set_flock_tile_running(flock_is_running());
+    refresh_flock_tile();
 
     // Receive-only pulse timing and change correlation. There is deliberately
     // no replay or transmit control on the destination screen.
     lv_obj_add_event_cb(t_rolling, [](lv_event_t *) { rolling_code_screen_show(); },
+                        LV_EVENT_CLICKED, NULL);
+
+    // Passive 802.11 management-frame inspection and SD note editing.
+    lv_obj_add_event_cb(t_packets, [](lv_event_t *) { packet_screen_show(); },
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(t_editor, [](lv_event_t *) { text_editor_screen_show(); },
                         LV_EVENT_CLICKED, NULL);
 
     // TPMS tile opens the TPMS monitor screen.
@@ -1119,6 +1180,7 @@ void tools_screen_create()
     }
 
     lv_obj_add_event_cb(tools_screen, on_gesture, LV_EVENT_GESTURE, NULL);
+    lv_timer_create(on_tools_status_timer, 300, nullptr);
 }
 
 void tools_screen_show()
@@ -1129,7 +1191,7 @@ void tools_screen_show()
     set_flipper_tile_running(flipper_is_running());
     set_skimmer_tile_running(skimmer_is_running());
     set_eviltwin_tile_running(evil_twin_is_running());
-    set_flock_tile_running(flock_is_running());
+    refresh_flock_tile();
     if (t_about_disc)
         lv_obj_set_style_border_color(t_about_disc, theme_accent_bright(), LV_PART_MAIN);
     if (t_about_info)

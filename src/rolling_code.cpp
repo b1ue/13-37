@@ -1,4 +1,5 @@
 #include "rolling_code.h"
+#include "lora_analyze_screen.h"
 #include "lora_screen.h"
 #include "pager.h"
 #include "tpms.h"
@@ -8,6 +9,7 @@
 #include <SD.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <math.h>
 #include <string.h>
@@ -23,6 +25,12 @@
 #define RC_END_SILENCE_US 12000U
 #define RC_MAX_FRAME_US   180000U
 #define RC_MIN_PULSES        12
+#define RC_STOP_TIMEOUT_MS  250U
+
+// Private errors live outside RadioLib's normal range so the UI can
+// distinguish lifecycle failures from radio-driver failures.
+#define RC_ERR_RADIO_BUSY   (-3001)
+#define RC_ERR_STOP_TIMEOUT (-3002)
 
 struct RollingCapture {
     uint16_t duration_us[RC_MAX_PULSES];
@@ -47,15 +55,8 @@ static int16_t        s_last_error = 0;
 static volatile float s_threshold = -127.0f;
 static TaskHandle_t   s_task = nullptr;
 static QueueHandle_t  s_queue = nullptr;
-
-static bool      s_prev_pager_running = false;
-static float     s_prev_pager_freq = 0.0f;
-static PagerMode s_prev_pager_mode = PAGER_POCSAG_1200;
-static bool      s_prev_pager_scan_all = false;
-static bool      s_prev_tpms_running = false;
-static bool      s_prev_tpms_433 = true;
-static TpmsFormat s_prev_tpms_format = TPMS_FORMAT_FSK;
-static bool      s_prev_aprs_running = false;
+static SemaphoreHandle_t s_stopped = nullptr;
+static volatile uint32_t s_stack_headroom = 0;
 
 static Fingerprint s_previous = {};
 static bool         s_have_previous = false;
@@ -77,19 +78,10 @@ static uint16_t clamp_u16(uint32_t value)
     return value > 65535U ? 65535U : (uint16_t)value;
 }
 
-static void restore_previous_radio_user()
+static bool another_radio_user_is_active()
 {
-    if (s_prev_pager_running) {
-        if (s_prev_pager_scan_all) pager_start_scanner(s_prev_pager_mode);
-        else pager_start(s_prev_pager_freq, s_prev_pager_mode);
-    }
-    if (s_prev_tpms_running)
-        tpms_start(s_prev_tpms_433, s_prev_tpms_format);
-    if (s_prev_aprs_running) aprs_start();
-
-    s_prev_pager_running = false;
-    s_prev_tpms_running = false;
-    s_prev_aprs_running = false;
+    return lora_screen_is_powered() || lora_analyze_is_running() ||
+           pager_is_running() || tpms_is_running() || aprs_is_running();
 }
 
 static uint16_t estimate_base_us(const RollingCapture &capture)
@@ -239,17 +231,18 @@ static void process_capture(const RollingCapture &capture)
 static void capture_task(void *)
 {
     float noise_sum = 0.0f;
-    for (int i = 0; i < 64 && s_running; ++i) {
+    uint8_t noise_samples = 0;
+    for (; noise_samples < 64 && s_running; ++noise_samples) {
         noise_sum += radio.getRSSI(false);
         vTaskDelay(pdMS_TO_TICKS(2));
     }
-    if (!s_running) vTaskSuspend(nullptr);
-    s_threshold = noise_sum / 64.0f + 10.0f;
+    if (s_running && noise_samples)
+        s_threshold = noise_sum / noise_samples + 10.0f;
 
-    while (true) {
-        if (!s_running) vTaskSuspend(nullptr);
-
+    while (s_running) {
         vTaskDelay(pdMS_TO_TICKS(1));
+        if (!s_running) break;
+        s_stack_headroom = (uint32_t)uxTaskGetStackHighWaterMark(nullptr);
         float rssi = radio.getRSSI(false);
         if (rssi <= s_threshold) continue;
 
@@ -291,93 +284,115 @@ static void capture_task(void *)
             if (spent < RC_SAMPLE_US) delayMicroseconds(RC_SAMPLE_US - spent);
         }
     }
+
+    // Signal completion before deleting ourselves. The controller waits for
+    // this acknowledgement before touching the shared radio again, avoiding
+    // a force-delete while RadioLib or SPI is mid-call.
+    s_stack_headroom = (uint32_t)uxTaskGetStackHighWaterMark(nullptr);
+    Serial.printf("[RollingRX] capture task stopped; stack headroom=%lu bytes\n",
+                  (unsigned long)s_stack_headroom);
+    s_task = nullptr;
+    if (s_stopped) xSemaphoreGive(s_stopped);
+    vTaskDelete(nullptr);
 }
 
 bool rolling_code_start()
 {
     if (s_running) return true;
     s_last_error = 0;
-    if (lora_screen_is_powered()) {
-        s_last_error = RADIOLIB_ERR_UNKNOWN;
+    if (s_task || another_radio_user_is_active()) {
+        s_last_error = RC_ERR_RADIO_BUSY;
+        Serial.println("[RollingRX] start refused: shared radio is busy");
         return false;
     }
-
-    s_prev_pager_running = pager_is_running();
-    s_prev_pager_freq = pager_get_freq();
-    s_prev_pager_mode = pager_get_mode();
-    s_prev_pager_scan_all = pager_is_scanning_all();
-    s_prev_tpms_running = tpms_is_running();
-    s_prev_tpms_433 = tpms_is_freq_433();
-    s_prev_tpms_format = tpms_get_format();
-    s_prev_aprs_running = aprs_is_running();
-    pager_stop();
-    tpms_stop();
-    aprs_stop();
 
     instance.powerControl(POWER_RADIO, true);
     int16_t rc = radio.beginFSK(s_frequencies[s_band], 4.8, 5.0, 234.3,
                                 10, 16, 1.6);
+    if (rc == RADIOLIB_ERR_NONE) rc = radio.setEncoding(RADIOLIB_ENCODING_NRZ);
+    uint8_t sync[] = { 0xD3, 0x91, 0xD3, 0x91 };
+    if (rc == RADIOLIB_ERR_NONE) rc = radio.setSyncWord(sync, sizeof(sync));
+    if (rc == RADIOLIB_ERR_NONE) rc = radio.setCRC(0);
+    if (rc == RADIOLIB_ERR_NONE) rc = radio.fixedPacketLengthMode(64);
+    if (rc == RADIOLIB_ERR_NONE) {
+        // A previously stopped packet decoder may have left an ISR callback
+        // installed. Rolling RX polls RSSI and must not dispatch that owner.
+        radio.clearPacketReceivedAction();
+        rc = radio.startReceive();
+    }
     s_last_error = rc;
     if (rc != RADIOLIB_ERR_NONE) {
-        restore_previous_radio_user();
+        Serial.printf("[RollingRX] radio initialization failed: %d\n", (int)rc);
+        radio.standby();
         return false;
     }
-    radio.setEncoding(RADIOLIB_ENCODING_NRZ);
-    uint8_t sync[] = { 0xD3, 0x91, 0xD3, 0x91 };
-    radio.setSyncWord(sync, sizeof(sync));
-    radio.setCRC(0);
-    radio.fixedPacketLengthMode(64);
-    radio.startReceive();
 
     if (!s_queue) s_queue = xQueueCreate(RC_QUEUE_LEN, sizeof(RollingCapture));
-    if (!s_queue) {
+    if (!s_stopped) s_stopped = xSemaphoreCreateBinary();
+    if (!s_queue || !s_stopped) {
         s_last_error = RADIOLIB_ERR_MEMORY_ALLOCATION_FAILED;
+        Serial.println("[RollingRX] start failed: queue/semaphore allocation");
         radio.standby();
-        restore_previous_radio_user();
         return false;
     }
     xQueueReset(s_queue);
+    xSemaphoreTake(s_stopped, 0);
+    s_stack_headroom = 0;
     s_running = true;
-    disableCore0WDT();
     BaseType_t created = xTaskCreatePinnedToCore(capture_task, "rolling_rx", 4096,
                                                  nullptr, 5, &s_task, 0);
     if (created != pdPASS) {
         s_running = false;
-        enableCore0WDT();
         s_task = nullptr;
         s_last_error = RADIOLIB_ERR_MEMORY_ALLOCATION_FAILED;
+        Serial.println("[RollingRX] start failed: task allocation");
         radio.standby();
-        restore_previous_radio_user();
         return false;
     }
+    Serial.printf("[RollingRX] receive-only analyzer started at %.2f MHz\n",
+                  (double)s_frequencies[s_band]);
     return true;
 }
 
-static void stop_receiver(bool restore_radio_user)
+static void stop_receiver()
 {
-    if (!s_running) return;
+    if (!s_running && !s_task) return;
     s_running = false;
-    if (s_task) {
-        vTaskDelete(s_task);
-        s_task = nullptr;
+
+    // In normal operation the task observes s_running within at most one RSSI
+    // sample and acknowledges via s_stopped. If the driver itself wedges, do
+    // not force-delete a task that may hold SPI state; report the timeout and
+    // leave the watchdog/reboot path available instead of corrupting the bus.
+    TaskHandle_t task = s_task;
+    if (task && task != xTaskGetCurrentTaskHandle() && s_stopped &&
+        xSemaphoreTake(s_stopped, pdMS_TO_TICKS(RC_STOP_TIMEOUT_MS)) != pdTRUE) {
+        s_last_error = RC_ERR_STOP_TIMEOUT;
+        Serial.println("[RollingRX] cooperative stop timed out; reboot recommended");
+        return;
     }
-    enableCore0WDT();
+
     radio.standby();
-    if (restore_radio_user) {
-        restore_previous_radio_user();
-    } else {
-        s_prev_pager_running = false;
-        s_prev_tpms_running = false;
-        s_prev_aprs_running = false;
-    }
+    Serial.printf("[RollingRX] receiver stopped; error=%d\n", (int)s_last_error);
 }
 
-void rolling_code_stop() { stop_receiver(true); }
+void rolling_code_stop() { stop_receiver(); }
 
-void rolling_code_prepare_for_sleep() { stop_receiver(false); }
+void rolling_code_prepare_for_sleep() { stop_receiver(); }
 
 bool rolling_code_is_running() { return s_running; }
 int16_t rolling_code_last_error() { return s_last_error; }
+const char *rolling_code_last_error_text()
+{
+    if (s_last_error == 0) return "";
+    if (s_last_error == RC_ERR_RADIO_BUSY)
+        return "Stop the other sub-GHz tool first";
+    if (s_last_error == RC_ERR_STOP_TIMEOUT)
+        return "Receiver stop timed out; reboot recommended";
+    if (s_last_error == RADIOLIB_ERR_MEMORY_ALLOCATION_FAILED)
+        return "Not enough memory to start receiver";
+    return "Radio initialization failed";
+}
+uint32_t rolling_code_stack_headroom() { return s_stack_headroom; }
 
 void rolling_code_set_band(uint8_t band)
 {

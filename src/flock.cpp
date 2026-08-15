@@ -5,6 +5,7 @@ void clock_screen_get_local_time(struct tm *out);
 void clock_screen_show_flock_alert(const char *vendor, const char *confidence,
                                    int8_t rssi);
 #include "ble_scan_manager.h"
+#include "usb_sd.h"
 #include "esp_gap_ble_api.h"
 #include "gps_screen.h"
 #include <LilyGoLib.h>
@@ -91,6 +92,14 @@ struct FlockHit {
 #define FLOCK_DEDUP_SLOTS  32
 #define FLOCK_DEDUP_MS     (5 * 60 * 1000u)
 #define FLOCK_QUEUE_LEN    16
+#define FLOCK_OBS_QUEUE_LEN 24
+
+struct FlockObservation {
+    uint8_t mac[6];
+    int8_t  rssi;
+    char    source;
+    char    name[33];
+};
 
 struct DedupSlot {
     uint8_t  mac[6];
@@ -101,6 +110,7 @@ struct DedupSlot {
 static DedupSlot     s_dedup[FLOCK_DEDUP_SLOTS] = {};
 static int           s_count = 0;
 static QueueHandle_t s_queue = nullptr;
+static QueueHandle_t s_observation_queue = nullptr;
 static bool          s_alerts_enabled = false;
 static bool          s_strong_only = false;
 
@@ -209,15 +219,56 @@ bool flock_check(const uint8_t *mac6, int8_t rssi, const char *name, char source
     return true;
 }
 
-static bool s_flock_running = false;
+enum FlockRunState : uint8_t {
+    FLOCK_STOPPED,
+    FLOCK_START_WIFI,
+    FLOCK_START_BLE,
+    FLOCK_RUNNING,
+    FLOCK_STOP_WIFI,
+    FLOCK_STOP_BLE,
+    FLOCK_FAILED,
+};
+
+static volatile bool s_flock_running = false;
+static FlockRunState s_run_state = FLOCK_STOPPED;
+static bool s_wifi_registered = false;
+static bool s_ble_registered = false;
+static volatile uint32_t s_observation_drops = 0;
+
+static bool enqueue_observation(const uint8_t *mac6, int8_t rssi,
+                                const char *name, char source)
+{
+    if (!s_flock_running || !s_observation_queue) return false;
+    // Read-only filtering is safe in either radio task and prevents ordinary
+    // beacons/advertisements from flooding the queue. Deduplication and all
+    // state mutation still happen later on the main loop.
+    if (oui_match(mac6) < 0 && (!name || !name[0] || !name_match(name)))
+        return false;
+
+    FlockObservation observation = {};
+    memcpy(observation.mac, mac6, sizeof(observation.mac));
+    observation.rssi = rssi;
+    observation.source = source;
+    if (name && name[0]) {
+        strncpy(observation.name, name, sizeof(observation.name) - 1);
+        observation.name[sizeof(observation.name) - 1] = '\0';
+    }
+
+    if (xQueueSend(s_observation_queue, &observation, 0) != pdTRUE) {
+        ++s_observation_drops;
+        return false;
+    }
+    return true;
+}
 
 static void flock_beacon_cb(const WifiBeacon *b)
 {
-    flock_check(b->bssid, b->rssi, b->ssid, 'W');
+    enqueue_observation(b->bssid, b->rssi, b->ssid, 'W');
 }
 
 static void flock_ble_cb(esp_ble_gap_cb_param_t *param)
 {
+    if (!s_flock_running) return;
     auto &res = param->scan_rst;
 
     char name[33] = {};
@@ -239,28 +290,92 @@ static void flock_ble_cb(esp_ble_gap_cb_param_t *param)
         pos += 1 + (int)seg_len;
     }
 
-    flock_check(res.bda, (int8_t)res.rssi, name, 'L');
+    enqueue_observation(res.bda, (int8_t)res.rssi, name, 'L');
 }
 
 bool flock_start()
 {
     if (s_flock_running) return true;
-    bool wifi_ok = wifi_beacon_add(flock_beacon_cb);
-    bool ble_ok  = ble_scan_add(flock_ble_cb);
-    if (!wifi_ok && !ble_ok) return false;
+    if (s_run_state == FLOCK_STOP_WIFI || s_run_state == FLOCK_STOP_BLE)
+        return false;
+
+    // Allocate before either radio callback can run. Radio tasks only copy a
+    // compact observation into this queue; matching, RTC/I2C access, alerts,
+    // GPS reads and SD logging stay on the main loop.
+    if (!s_observation_queue)
+        s_observation_queue = xQueueCreate(FLOCK_OBS_QUEUE_LEN,
+                                           sizeof(FlockObservation));
+    if (!s_queue)
+        s_queue = xQueueCreate(FLOCK_QUEUE_LEN, sizeof(FlockHit));
+    if (!s_observation_queue || !s_queue) {
+        s_run_state = FLOCK_FAILED;
+        Serial.println("[Flock] start failed: queue allocation");
+        return false;
+    }
+
+    xQueueReset(s_observation_queue);
+    s_observation_drops = 0;
+    s_wifi_registered = false;
+    s_ble_registered = false;
     s_flock_running = true;
+    s_run_state = FLOCK_START_WIFI;
+    Serial.println("[Flock] start requested; staging WiFi then BLE");
     return true;
 }
 
 void flock_stop()
 {
-    if (!s_flock_running) return;
+    if (!s_flock_running && s_run_state == FLOCK_STOPPED) return;
     s_flock_running = false;
-    wifi_beacon_remove(flock_beacon_cb);
-    ble_scan_remove(flock_ble_cb);
+    // The old path tore both controllers down inside the tile's CLICKED
+    // callback. Stage each unregister on later loop passes so the next touch
+    // or hardware-button event cannot collide with controller teardown.
+    if (s_wifi_registered) s_run_state = FLOCK_STOP_WIFI;
+    else if (s_ble_registered) s_run_state = FLOCK_STOP_BLE;
+    else s_run_state = FLOCK_STOPPED;
+}
+
+void flock_prepare_for_sleep()
+{
+    // Deep sleep is already a terminal transition, so remove registrations
+    // immediately. The BLE manager's final hardware shutdown remains async;
+    // ESP deep sleep powers the controller domain down moments later.
+    s_flock_running = false;
+    if (s_wifi_registered) {
+        wifi_beacon_remove(flock_beacon_cb);
+        s_wifi_registered = false;
+    }
+    if (s_ble_registered) {
+        ble_scan_remove(flock_ble_cb);
+        s_ble_registered = false;
+    }
+    if (s_observation_queue) xQueueReset(s_observation_queue);
+    s_run_state = FLOCK_STOPPED;
 }
 
 bool flock_is_running() { return s_flock_running; }
+bool flock_is_starting()
+{
+    return s_run_state == FLOCK_START_WIFI || s_run_state == FLOCK_START_BLE;
+}
+bool flock_is_stopping()
+{
+    return s_run_state == FLOCK_STOP_WIFI || s_run_state == FLOCK_STOP_BLE;
+}
+const char *flock_status_text()
+{
+    switch (s_run_state) {
+    case FLOCK_START_WIFI: return "Starting WiFi";
+    case FLOCK_START_BLE:  return "Starting BLE";
+    case FLOCK_RUNNING:
+        if (s_wifi_registered && s_ble_registered) return "WiFi + BLE";
+        return s_wifi_registered ? "WiFi only" : "BLE only";
+    case FLOCK_STOP_WIFI: return "Stopping WiFi";
+    case FLOCK_STOP_BLE:  return "Stopping BLE";
+    case FLOCK_FAILED:     return "Start failed";
+    default:               return "Stopped";
+    }
+}
 
 void flock_set_alerts_enabled(bool enabled) { s_alerts_enabled = enabled; }
 bool flock_alerts_enabled() { return s_alerts_enabled; }
@@ -277,7 +392,61 @@ void flock_reset_count()
 
 void flock_bg_tick()
 {
-    if (!s_queue) return;
+    if (s_run_state == FLOCK_STOP_WIFI) {
+        if (s_wifi_registered) {
+            wifi_beacon_remove(flock_beacon_cb);
+            s_wifi_registered = false;
+        }
+        s_run_state = s_ble_registered ? FLOCK_STOP_BLE : FLOCK_STOPPED;
+        return;
+    }
+    if (s_run_state == FLOCK_STOP_BLE) {
+        if (s_ble_registered) {
+            ble_scan_remove(flock_ble_cb);
+            s_ble_registered = false;
+        }
+        if (s_observation_queue) xQueueReset(s_observation_queue);
+        s_run_state = FLOCK_STOPPED;
+        Serial.printf("[Flock] stopped; dropped observations=%lu\n",
+                      (unsigned long)s_observation_drops);
+        return;
+    }
+
+    // Bring the two radios up on separate main-loop passes. Each manager can
+    // take noticeable time to initialize; separating them guarantees an LVGL
+    // refresh between operations and prevents the tile callback from doing
+    // any controller work.
+    if (s_flock_running && s_run_state == FLOCK_START_WIFI) {
+        s_wifi_registered = wifi_beacon_add(flock_beacon_cb);
+        s_run_state = FLOCK_START_BLE;
+        Serial.printf("[Flock] WiFi stage: %s\n",
+                      s_wifi_registered ? "ready" : "unavailable");
+        return;
+    }
+    if (s_flock_running && s_run_state == FLOCK_START_BLE) {
+        s_ble_registered = ble_scan_add(flock_ble_cb);
+        if (!s_wifi_registered && !s_ble_registered) {
+            s_flock_running = false;
+            s_run_state = FLOCK_FAILED;
+            Serial.println("[Flock] start failed: both radios unavailable");
+            return;
+        }
+        s_run_state = FLOCK_RUNNING;
+        Serial.printf("[Flock] running: %s\n", flock_status_text());
+        return;
+    }
+
+    // Drain one raw radio observation per pass. flock_check() now runs only
+    // here (or from the wardriver's main-loop drain), so its dedup table,
+    // queue, RTC and count state are never shared by WiFi and BLE tasks.
+    if (s_observation_queue) {
+        FlockObservation observation;
+        if (xQueueReceive(s_observation_queue, &observation, 0) == pdTRUE)
+            flock_check(observation.mac, observation.rssi, observation.name,
+                        observation.source);
+    }
+
+    if (!s_queue || usb_sd_is_running()) return;
 
     // One hit per tick - same pattern as the other detectors. A burst of
     // Flock-OUI matches (every dashcam-equipped car nearby) would otherwise

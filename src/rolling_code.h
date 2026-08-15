@@ -9,6 +9,8 @@ void rolling_code_stop();
 void rolling_code_prepare_for_sleep();
 bool rolling_code_is_running();
 int16_t rolling_code_last_error();
+const char *rolling_code_last_error_text();
+uint32_t rolling_code_stack_headroom();
 
 void rolling_code_set_band(uint8_t band);
 uint8_t rolling_code_get_band();

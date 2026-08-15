@@ -20,7 +20,11 @@ void flock_reset_count();
 // detector runs without the wardriver.
 bool flock_start();
 void flock_stop();
+void flock_prepare_for_sleep();
 bool flock_is_running();
+bool flock_is_starting();
+bool flock_is_stopping();
+const char *flock_status_text();
 
 // Passive, local-only alert policy. These options do not start either radio
 // and therefore do not change the detector or deep-sleep lifecycle.

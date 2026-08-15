@@ -245,6 +245,8 @@ static const uint32_t SLEEP_TIMEOUT_MS[] = {
     30UL * 60UL * 1000UL,
     60UL * 60UL * 1000UL,
     2UL  * 60UL * 60UL * 1000UL,
+    60UL * 1000UL,
+    5UL * 60UL * 1000UL,
 };
 
 static void on_dim_timeout_changed(lv_event_t *e)
@@ -907,7 +909,10 @@ void settings_screen_create()
     lv_obj_align(sleep_lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
     sleep_dropdown = lv_dropdown_create(sleep_row);
-    lv_dropdown_set_options(sleep_dropdown, "OFF\n15 Minutes\n30 Minutes\n1 Hour\n2 Hours");
+    // Keep the original five indices stable for existing settings files;
+    // short test/low-power modes are appended rather than inserted.
+    lv_dropdown_set_options(sleep_dropdown,
+        "OFF\n15 Minutes\n30 Minutes\n1 Hour\n2 Hours\n1 Minute (Test)\n5 Minutes");
     lv_dropdown_set_selected(sleep_dropdown, 2);
     lv_obj_set_size(sleep_dropdown, 185, 34);
     lv_obj_set_style_text_font(sleep_dropdown, &lv_font_montserrat_16, LV_PART_MAIN);
