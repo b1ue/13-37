@@ -29,8 +29,8 @@ static int           s_count   = 0;
 static QueueHandle_t s_queue   = nullptr;
 
 // Dedup table. A single AirTag advertises every ~2 s — without this we'd be
-// writing the same MAC to the SD many times a minute. Touched only from the
-// BT task in ble_gap_cb(), so no locking needed.
+// writing the same MAC to the SD many times a minute. The shared BLE manager
+// dispatches checks on the main loop, so no locking is needed.
 #define AIRTAG_SEEN_SIZE 32
 static struct { uint8_t mac[6]; uint32_t last_ms; } s_seen[AIRTAG_SEEN_SIZE];
 static int s_seen_count = 0;
@@ -65,8 +65,8 @@ static bool seen_recently_or_mark(const uint8_t *mac)
 }
 
 // Core detection: scan one advertisement for Apple Find My manufacturer data.
-// Shared by the standalone scanner and the wardriver — both call this from the
-// BT task, so the dedup table and counters need no locking.
+// Shared by the standalone scanner and the wardriver. Both are dispatched by
+// the shared BLE manager on the main loop.
 bool airtag_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
                   const uint8_t *adv, int adv_len)
 {

@@ -10,9 +10,9 @@
 // detector, flock detector, and any future features can share the same scan
 // without trampling each other.
 //
-// WiFi is put in STA+promiscuous mode on the first add() call and torn down
-// on the last remove() (reference-counted).  Channel hopping (200 ms, 1-13)
-// is managed internally.
+// WiFi is put in STA+promiscuous mode after the first add() call and torn down
+// after the last remove() (reference-counted). Driver transitions are
+// asynchronous; channel hopping (200 ms, 1-13) is managed internally.
 
 struct WifiBeacon {
     uint8_t bssid[6];
@@ -25,11 +25,15 @@ struct WifiBeacon {
 typedef void (*wifi_beacon_cb_t)(const WifiBeacon *b);
 
 // Register a consumer.  Idempotent — adding the same cb twice is a no-op.
-// Returns false if WiFi init fails or the consumer table is full.
+// Returns false if queue allocation fails or the consumer table is full.
 bool wifi_beacon_add(wifi_beacon_cb_t cb);
 
 // Unregister a consumer.  WiFi is torn down when the last consumer leaves.
 void wifi_beacon_remove(wifi_beacon_cb_t cb);
 
-// True if at least one consumer is registered.
+// Progress asynchronous radio lifecycle and deliver a bounded number of
+// queued beacons to consumers on the main loop. Call frequently.
+void wifi_beacon_tick();
+
+// True while a consumer is registered or the radio lifecycle is winding down.
 bool wifi_beacon_active();

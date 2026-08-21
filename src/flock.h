@@ -16,8 +16,9 @@ int  flock_get_count();
 void flock_bg_tick();
 void flock_reset_count();
 
-// Standalone tile API -- starts/stops dedicated WiFi and BLE scans so the
-// detector runs without the wardriver.
+// Standalone tile API. The toggle owns a passive BLE scan. WiFi sightings are
+// supplied by Wardriver when it is active, avoiding a fragile and expensive
+// promiscuous-WiFi cold start from the Flock tile.
 bool flock_start();
 void flock_stop();
 void flock_prepare_for_sleep();

@@ -3,6 +3,7 @@
 #include <LV_Helper.h>
 #include <bosch/BoschSensorDataHelper.hpp>
 #include "esp_wifi.h"
+#include "esp_sleep.h"
 #include <WiFi.h>
 #include <time.h>
 #include <math.h>
@@ -57,9 +58,12 @@
 #include "time_screen.h"
 #include "airtag.h"
 #include "flipper.h"
+#include "flipper_remote.h"
+#include "flipper_remote_screen.h"
 #include "skimmer.h"
 #include "evil_twin.h"
 #include "flock.h"
+#include "firmware_version.h"
 #include "mouse_hid.h"
 #include "ble_scan_manager.h"
 #include "wifi_beacon_manager.h"
@@ -120,7 +124,11 @@ static lv_obj_t *stopwatch_indicator;
 // envelope + count duplicated this number, so it was removed.
 static lv_obj_t *mesh_top_count_label;
 
-// AirTag sniffer indicator (above battery, shown only while scanner is active)
+// Compact status pill for enabled passive detector tiles. Individual detector
+// badges are reserved for actual hits, avoiding five zero-count icons.
+static lv_obj_t *scanner_active_indicator;
+
+// AirTag hit indicator (above battery, shown only after a detection)
 static lv_obj_t *airtag_indicator;
 static lv_obj_t *airtag_count_label;
 
@@ -140,6 +148,10 @@ static lv_obj_t *evil_twin_count_label;
 static lv_obj_t *flock_indicator;
 static lv_obj_t *flock_count_label;
 static lv_obj_t *flock_alert_banner;
+static lv_obj_t *retro_top_label;
+static lv_obj_t *retro_bottom_label;
+static lv_obj_t *retro_top_line;
+static lv_obj_t *retro_bottom_line;
 static lv_timer_t *flock_alert_timer;
 
 // Battery body geometry (pixels)
@@ -673,16 +685,20 @@ void clock_screen_set_lora_active(bool active)
 
 // Positions AirTag, Flipper, Skimmer, EvilTwin, and Flock indicators relative
 // to each other and the mesh envelope. From right to left: mesh, AirTag,
-// Flipper, Skimmer, EvilTwin, Flock. Each indicator only takes a slot when
-// it's visible, so when one is hidden the others slide right to fill in.
-// Spacing: 65 px per slot; mesh occupies the rightmost position (x ~ 0).
+// One compact eye badge counts enabled detectors. Named badges are reserved
+// for actual hits and pack left from it, so the face stays readable.
 static void update_scan_indicators()
 {
-    if (!airtag_indicator || !flock_indicator ||
+    if (!scanner_active_indicator || !airtag_indicator || !flock_indicator ||
         !flipper_indicator || !skimmer_indicator ||
         !evil_twin_indicator) return;
 
-    bool airtag_vis   = airtag_is_running()    || airtag_get_count()    > 0;
+    int active_scanners = (airtag_is_running()    ? 1 : 0)
+                        + (flipper_is_running()   ? 1 : 0)
+                        + (skimmer_is_running()   ? 1 : 0)
+                        + (evil_twin_is_running() ? 1 : 0)
+                        + (flock_is_running()     ? 1 : 0);
+    bool airtag_vis   = (airtag_get_count()    > 0);
     // Flipper / Skimmer / EvilTwin indicators show only when at least one
     // detection has happened — they stay hidden while the wardriver /
     // detector is idle or running with zero hits.
@@ -690,6 +706,18 @@ static void update_scan_indicators()
     bool skimmer_vis  = (skimmer_get_count()   > 0);
     bool eviltwin_vis = (evil_twin_get_count() > 0);
     bool flock_vis    = (flock_get_count()     > 0);
+
+    if (active_scanners > 0) {
+        lv_obj_clear_flag(scanner_active_indicator, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text_fmt(scanner_active_indicator,
+                              LV_SYMBOL_EYE_OPEN " %d", active_scanners);
+        lv_obj_set_style_text_color(scanner_active_indicator,
+                                    theme_accent_bright(), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(scanner_active_indicator,
+                                  theme_accent_dark(), LV_PART_MAIN);
+    } else {
+        lv_obj_add_flag(scanner_active_indicator, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (airtag_vis) {
         lv_obj_clear_flag(airtag_indicator, LV_OBJ_FLAG_HIDDEN);
@@ -726,7 +754,7 @@ static void update_scan_indicators()
         lv_obj_add_flag(flock_indicator, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (!airtag_vis && !flipper_vis && !skimmer_vis &&
+    if (active_scanners == 0 && !airtag_vis && !flipper_vis && !skimmer_vis &&
         !eviltwin_vis && !flock_vis) return;
 
     // Row order, left -> right:
@@ -736,6 +764,10 @@ static void update_scan_indicators()
     // by 65 px per visible indicator so hidden ones collapse without
     // leaving a gap.
     int slot = 0;
+    if (active_scanners > 0) {
+        lv_obj_align(scanner_active_indicator, LV_ALIGN_BOTTOM_MID, slot, -60);
+        slot -= 65;
+    }
     if (skimmer_vis) {
         lv_obj_align(skimmer_indicator, LV_ALIGN_BOTTOM_MID, slot, -60);
         slot -= 65;
@@ -860,6 +892,30 @@ static void recolor_clock_icon(lv_obj_t *icon, lv_color_t color)
 
 void clock_screen_apply_theme()
 {
+    if (clock_screen)
+        lv_obj_set_style_bg_color(clock_screen, theme_background(), LV_PART_MAIN);
+    if (time_label && !matrix_face)
+        lv_obj_set_style_text_color(time_label,
+            theme_is_retro() ? theme_accent_bright() : theme_text(), LV_PART_MAIN);
+    if (date_label && !matrix_face)
+        lv_obj_set_style_text_color(date_label,
+            theme_is_retro() ? theme_secondary() : theme_muted(), LV_PART_MAIN);
+    const bool retro = theme_is_retro();
+    lv_obj_t *retro_objs[] = { retro_top_label, retro_bottom_label,
+                               retro_top_line, retro_bottom_line };
+    for (lv_obj_t *obj : retro_objs) {
+        if (!obj) continue;
+        if (retro) lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (retro_top_label)
+        lv_obj_set_style_text_color(retro_top_label, theme_secondary(), LV_PART_MAIN);
+    if (retro_bottom_label)
+        lv_obj_set_style_text_color(retro_bottom_label, theme_accent_mid(), LV_PART_MAIN);
+    if (retro_top_line)
+        lv_obj_set_style_bg_color(retro_top_line, theme_secondary(), LV_PART_MAIN);
+    if (retro_bottom_line)
+        lv_obj_set_style_bg_color(retro_bottom_line, theme_accent_mid(), LV_PART_MAIN);
     matrix_bg_refresh_theme();
     clock_screen_set_matrix(matrix_face);
     update_lora_indicator();
@@ -881,7 +937,9 @@ void clock_screen_apply_theme()
 static uint32_t s_dim_timeout_ms   = 0;   // 0 = disabled
 static uint8_t  s_dim_brightness   = DEVICE_MAX_BRIGHTNESS_LEVEL / 4;
 static uint8_t  s_active_brightness = DEVICE_MAX_BRIGHTNESS_LEVEL;
+static uint32_t s_standby_timeout_ms = 5UL * 60UL * 1000UL;
 static uint32_t s_sleep_timeout_ms  = 30UL * 60UL * 1000UL; // idle deep-sleep default
+static bool     s_standby_touch_wake = true;
 static bool     s_keep_awake_screen = true;
 static bool     s_keep_awake_wifi   = false;
 static bool     s_keep_awake_radios = true;
@@ -931,7 +989,7 @@ void clock_screen_set_dim_brightness(uint8_t level)
 static void dim_reset_activity()
 {
     s_last_activity_ms = millis();
-    if (s_is_dimmed) {
+    if (s_is_dimmed || s_display_asleep) {
         s_is_dimmed = false;
         wake_display_if_needed();
         instance.setBrightness(s_active_brightness);
@@ -942,6 +1000,17 @@ void clock_screen_set_sleep_timeout(uint32_t ms)
 {
     s_sleep_timeout_ms = ms;
     s_last_activity_ms = millis();
+}
+
+void clock_screen_set_standby_timeout(uint32_t ms)
+{
+    s_standby_timeout_ms = ms;
+    s_last_activity_ms = millis();
+}
+
+void clock_screen_set_standby_touch_wake(bool enabled)
+{
+    s_standby_touch_wake = enabled;
 }
 
 static void dismiss_flock_alert(lv_timer_t *)
@@ -1068,20 +1137,70 @@ static void motion_wake_poll()
     }
 }
 
-static bool idle_deep_sleep_allowed()
-{
-    // Alarms and timepieces are hard safety blockers: deep sleep would stop
-    // their software timers and cause the alert to be missed.
-    if (alarm_is_enabled() || alarm_is_ringing()) return false;
-    if (timer_is_running() || stopwatch_is_running()) return false;
+// Wake a little before the target minute so setup(), SD settings restore and
+// the first alarm_tick() all complete before the alarm is due. The timer wake
+// source is enabled alongside LilyGoLib's power/boot-button EXT1 sources.
+void clock_screen_get_local_time(struct tm *out);
+static constexpr uint32_t ALARM_WAKE_EARLY_SECONDS = 15U;
+static constexpr uint32_t ALARM_SLEEP_MIN_MARGIN_SECONDS = 5U;
 
-    if (s_keep_awake_screen && lv_screen_active() != clock_screen) return false;
+static bool next_alarm_sleep_delay(uint32_t *delay_seconds)
+{
+    if (!alarm_is_enabled() || alarm_is_ringing() || alarm_is_snoozed())
+        return false;
+
+    struct tm now = {};
+    clock_screen_get_local_time(&now);
+    if (now.tm_hour < 0 || now.tm_hour > 23 || now.tm_min < 0 ||
+        now.tm_min > 59 || now.tm_sec < 0 || now.tm_sec > 59)
+        return false;
+
+    int alarm_hour = 0;
+    int alarm_minute = 0;
+    alarm_get_next_fire_time(&alarm_hour, &alarm_minute);
+    if (alarm_hour < 0 || alarm_hour > 23 ||
+        alarm_minute < 0 || alarm_minute > 59)
+        return false;
+
+    // Stay awake throughout the target minute. alarm_tick() will either ring
+    // or the user will dismiss it; treating it as tomorrow here could miss an
+    // alarm if this loop happens to run just before alarm_tick().
+    if (now.tm_hour == alarm_hour && now.tm_min == alarm_minute)
+        return false;
+
+    const int now_seconds = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec;
+    const int alarm_seconds = alarm_hour * 3600 + alarm_minute * 60;
+    int until_alarm = alarm_seconds - now_seconds;
+    if (until_alarm < 0) until_alarm += 24 * 60 * 60;
+
+    const uint32_t required = ALARM_WAKE_EARLY_SECONDS +
+                              ALARM_SLEEP_MIN_MARGIN_SECONDS;
+    if (until_alarm <= (int)required) return false;
+    if (delay_seconds)
+        *delay_seconds = (uint32_t)until_alarm - ALARM_WAKE_EARLY_SECONDS;
+    return true;
+}
+
+static const char *idle_deep_sleep_blocker()
+{
+    if (alarm_is_ringing()) return "alarm ringing";
+    // Snooze is RAM-only, so preserve it by staying awake. A normal daily
+    // alarm can sleep because enter_idle_deep_sleep() arms a timer wake.
+    if (alarm_is_snoozed()) return "alarm snoozed";
+    if (alarm_is_enabled() && !next_alarm_sleep_delay(nullptr))
+        return "alarm imminent";
+    if (timer_is_running()) return "timer running";
+    if (stopwatch_is_running()) return "stopwatch running";
+
+    if (s_keep_awake_screen && lv_screen_active() != clock_screen)
+        return "current screen keep-awake";
 
     if (s_keep_awake_wifi &&
         (wifi_radio_screen_is_powered() || WiFi.status() == WL_CONNECTED ||
          pingsweep_is_running() || portscan_is_running() ||
          hostresolve_is_running() || stock_screen_is_fetching() ||
-         packet_capture_is_running() || packet_capture_is_starting())) return false;
+         packet_capture_is_running() || packet_capture_is_starting()))
+        return "WiFi keep-awake";
 
     if (s_keep_awake_radios &&
         (gps_screen_is_powered() || nfc_screen_is_powered() ||
@@ -1089,21 +1208,112 @@ static bool idle_deep_sleep_allowed()
          aprs_is_running() || lora_analyze_is_running() || rolling_code_is_running() ||
          meshtastic_is_active() ||
          bluetooth_screen_is_powered() || ble_scan_active() ||
-         mouse_hid_is_running())) return false;
+         mouse_hid_is_running()))
+        return "radio keep-awake";
 
     if (s_keep_awake_tools &&
         (wardriver_is_running() || evil_twin_is_running() || flock_is_running() ||
          airtag_is_running() || flipper_is_running() || skimmer_is_running() ||
-         wifi_beacon_active())) return false;
+         wifi_beacon_active()))
+        return "tool keep-awake";
 
     // Never unmount storage from a host computer automatically.
-    if (usb_sd_is_running()) return false;
+    if (usb_sd_is_running()) return "USB SD active";
 
-    return true;
+    return nullptr;
+}
+
+// RAM-preserving standby. Unlike LilyGoUltra::lightSleep(), this path does
+// not unmount SD or power-cycle GPS/NFC/radio rails; the common blocker above
+// guarantees those services are idle before the CPU is suspended. That keeps
+// wake fast and avoids changing ownership/state behind running applications.
+static void enter_idle_light_sleep()
+{
+    if (!s_display_asleep) {
+        matrix_bg_set_paused(true);
+        instance.setBrightness(0);
+        instance.sleepDisplay();
+        s_display_asleep = true;
+        s_is_dimmed = true;
+    }
+
+    uint64_t wake_pins = (1ULL << PMU_INT) | (1ULL << GPIO_NUM_0);
+    bool touch_armed = false;
+    // A pending low touch IRQ would cause an immediate wake loop. Only arm it
+    // when the Ultra's RTC-capable interrupt line is quiescent.
+    if (s_standby_touch_wake &&
+        esp_sleep_is_valid_wakeup_gpio((gpio_num_t)TP_INT) &&
+        digitalRead(TP_INT) == HIGH) {
+        wake_pins |= (1ULL << TP_INT);
+        touch_armed = true;
+    }
+
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_err_t ext_rc = esp_sleep_enable_ext1_wakeup_io(
+        wake_pins, ESP_EXT1_WAKEUP_ANY_LOW);
+#else
+    esp_err_t ext_rc = esp_sleep_enable_ext1_wakeup(
+        wake_pins, ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
+    if (ext_rc != ESP_OK) {
+        Serial.printf("[Power] standby cancelled: EXT1 error %d\n", (int)ext_rc);
+        return;
+    }
+
+    uint32_t timer_seconds = 0;
+    const uint32_t idle_ms = millis() - s_last_activity_ms;
+    if (s_sleep_timeout_ms > idle_ms) {
+        timer_seconds = (s_sleep_timeout_ms - idle_ms + 999U) / 1000U;
+    }
+    uint32_t alarm_seconds = 0;
+    if (next_alarm_sleep_delay(&alarm_seconds) &&
+        (timer_seconds == 0 || alarm_seconds < timer_seconds))
+        timer_seconds = alarm_seconds;
+    if (timer_seconds > 0)
+        esp_sleep_enable_timer_wakeup((uint64_t)timer_seconds * 1000000ULL);
+
+    Serial.printf("[Power] light-sleep standby (touch %s, timer %lu s)\n",
+                  touch_armed ? "armed" : "off",
+                  (unsigned long)timer_seconds);
+    Serial.flush();
+    esp_light_sleep_start();
+    const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+
+    Serial.printf("[Power] standby wake cause %d\n", (int)cause);
+    if (cause != ESP_SLEEP_WAKEUP_TIMER) {
+        // Power, BOOT and touch are user activity. Timer wake intentionally
+        // keeps the panel dark so the loop can transition to deep sleep or
+        // service an imminent alarm without a visible flash.
+        dim_reset_activity();
+    }
 }
 
 static void enter_idle_deep_sleep()
 {
+    uint32_t alarm_wake_seconds = 0;
+    if (alarm_is_enabled()) {
+        if (!next_alarm_sleep_delay(&alarm_wake_seconds)) {
+            Serial.println("[Power] deep sleep cancelled: alarm wake unavailable");
+            return;
+        }
+        esp_err_t wake_rc = esp_sleep_enable_timer_wakeup(
+            (uint64_t)alarm_wake_seconds * 1000000ULL);
+        if (wake_rc != ESP_OK) {
+            Serial.printf("[Power] deep sleep cancelled: alarm timer error %d\n",
+                          (int)wake_rc);
+            return;
+        }
+        Serial.printf("[Power] alarm wake armed in %lu s (%lu s early)\n",
+                      (unsigned long)alarm_wake_seconds,
+                      (unsigned long)ALARM_WAKE_EARLY_SECONDS);
+    }
+    Serial.printf("[Power] entering deep sleep (firmware %s, build %s)\n",
+                  FW_VERSION, FW_BUILD_ID);
+    Serial.flush();
     matrix_bg_set_paused(true);
     instance.setBrightness(0);
 
@@ -1120,7 +1330,9 @@ static void enter_idle_deep_sleep()
 
     // Use the board library's sleep path: it sleeps and ends the display,
     // flushes/unmounts SD, disables measurement and peripheral rails, clears
-    // PMU IRQ state, resets bus pins, and configures both wake sources.
+    // PMU IRQ state, resets bus pins, and configures both button wake sources.
+    // If an alarm is enabled, the ESP timer source armed above remains active
+    // too, so either a button or the upcoming alarm can reboot the watch.
     instance.sleep((WakeupSource_t)(WAKEUP_SRC_POWER_KEY | WAKEUP_SRC_BOOT_BUTTON),
                    false, 0);
 }
@@ -1375,17 +1587,13 @@ static void update_clock()
     lv_label_set_text(date_label, date_buf);
 }
 
-// Firmware name + version surfaced in the boot banner so support tickets carry
-// a fixed anchor. Bump FW_VERSION on each cut.
-#define FW_NAME    "13:37"
-#define FW_VERSION "1.0.0"
-
 void setup()
 {
     Serial.begin(115200);
     delay(50);   // let the USB-CDC link settle so the banner isn't truncated
-    Serial.printf("\n%s firmware v%s  (T-Watch Ultra)  build %s %s\n",
-                  FW_NAME, FW_VERSION, __DATE__, __TIME__);
+    Serial.printf("\n%s firmware v%s  revision %s  feature %s\n",
+                  FW_NAME, FW_VERSION, FW_BUILD_ID, FW_FEATURE_SET);
+    Serial.printf("Compiled %s %s for T-Watch Ultra\n", __DATE__, __TIME__);
 
     instance.begin();
     instance.powerControl(POWER_NFC, false); // ensure NFC is off on boot
@@ -1403,7 +1611,12 @@ void setup()
     lv_label_set_text(boot_brand, FW_NAME);
     lv_obj_set_style_text_color(boot_brand, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(boot_brand, &lv_font_montserrat_clock_96, LV_PART_MAIN);
-    lv_obj_center(boot_brand);
+    lv_obj_align(boot_brand, LV_ALIGN_CENTER, 0, -24);
+    lv_obj_t *boot_version = lv_label_create(boot_splash);
+    lv_label_set_text_fmt(boot_version, "v%s  |  %s", FW_VERSION, FW_BUILD_ID);
+    lv_obj_set_style_text_color(boot_version, lv_color_make(0x88, 0xCC, 0xAA), LV_PART_MAIN);
+    lv_obj_set_style_text_font(boot_version, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_align(boot_version, LV_ALIGN_CENTER, 0, 72);
     lv_scr_load(boot_splash);
     lv_refr_now(NULL);                       // paint now; no timer handler in setup yet
     uint32_t boot_splash_ms = millis();
@@ -1426,6 +1639,33 @@ void setup()
 
     // First child → renders behind every other widget on the clock screen
     matrix_bg_create(clock_screen);
+
+    // Optional vector-terminal instrumentation layer. These thin, squared
+    // references stay separate from Matrix/Stock Rain and are revealed by
+    // clock_screen_apply_theme() only for the Retro Vector UI palette.
+    retro_top_label = lv_label_create(clock_screen);
+    lv_obj_set_style_text_font(retro_top_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_label_set_text(retro_top_label, "SYS//1337   RTC:LOCK   BUS:A");
+    lv_obj_align(retro_top_label, LV_ALIGN_TOP_MID, 0, 72);
+    lv_obj_add_flag(retro_top_label, LV_OBJ_FLAG_HIDDEN);
+    retro_top_line = lv_obj_create(clock_screen);
+    lv_obj_set_size(retro_top_line, 292, 1);
+    lv_obj_set_style_border_width(retro_top_line, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(retro_top_line, 0, LV_PART_MAIN);
+    lv_obj_align(retro_top_line, LV_ALIGN_TOP_MID, 0, 94);
+    lv_obj_add_flag(retro_top_line, LV_OBJ_FLAG_HIDDEN);
+
+    retro_bottom_label = lv_label_create(clock_screen);
+    lv_obj_set_style_text_font(retro_bottom_label, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_label_set_text(retro_bottom_label, "PWR/STANDBY   VECTOR TELEMETRY");
+    lv_obj_align(retro_bottom_label, LV_ALIGN_BOTTOM_MID, 0, -53);
+    lv_obj_add_flag(retro_bottom_label, LV_OBJ_FLAG_HIDDEN);
+    retro_bottom_line = lv_obj_create(clock_screen);
+    lv_obj_set_size(retro_bottom_line, 292, 1);
+    lv_obj_set_style_border_width(retro_bottom_line, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(retro_bottom_line, 0, LV_PART_MAIN);
+    lv_obj_align(retro_bottom_line, LV_ALIGN_BOTTOM_MID, 0, -76);
+    lv_obj_add_flag(retro_bottom_line, LV_OBJ_FLAG_HIDDEN);
 
     // GPS indicator — anchored to top-right; others chain off it via realign_status_icons()
     gps_indicator = lv_label_create(clock_screen);
@@ -1552,9 +1792,24 @@ void setup()
     lv_obj_align(timer_indicator,     LV_ALIGN_BOTTOM_MID, -158, -10);
     build_analog_clock(clock_screen);
 
-    // AirTag scanner indicator — flex row of disc-icon + count. Hidden until
-    // airtag_is_running(); update_airtag_indicator() positions it left of the
-    // mesh icon when both are visible, or centered when only this one is.
+    // One eye + count shows how many detector tiles are enabled. Named badges
+    // appear only for detections, keeping the face compact with all scanners on.
+    scanner_active_indicator = lv_label_create(clock_screen);
+    lv_obj_set_style_text_font(scanner_active_indicator,
+                               &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(scanner_active_indicator,
+                                theme_accent_bright(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scanner_active_indicator,
+                              theme_accent_dark(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scanner_active_indicator, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(scanner_active_indicator, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(scanner_active_indicator, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(scanner_active_indicator, 2, LV_PART_MAIN);
+    lv_label_set_text(scanner_active_indicator, LV_SYMBOL_EYE_OPEN " 0");
+    lv_obj_add_flag(scanner_active_indicator, LV_OBJ_FLAG_HIDDEN);
+
+    // AirTag hit indicator — flex row of disc-icon + count. It remains hidden
+    // at zero; update_scan_indicators() packs it beside the active-scan badge.
     airtag_indicator = lv_obj_create(clock_screen);
     lv_obj_set_size(airtag_indicator, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(airtag_indicator, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -1753,6 +2008,7 @@ void setup()
     tpms_screen_create();
     pager_screen_create();
     mouse_screen_create();
+    flipper_remote_screen_create();
     usb_sd_screen_create();
     aprs_screen_create();
     tesla_cp_screen_create();
@@ -1889,6 +2145,9 @@ void loop()
                 tools_screen_show();
             } else if (about_screen_is_active()) {
                 tools_screen_show();
+            } else if (flipper_remote_screen_is_active()) {
+                flipper_remote_screen_stop();
+                tools_screen_show();
             } else if (rolling_code_screen_is_active()) {
                 rolling_code_screen_stop();
                 tools_screen_show();
@@ -1982,10 +2241,15 @@ void loop()
         // Flock lifecycle stages and BLE controller teardown must continue
         // even while USB owns the SD card; flock_bg_tick self-gates logging.
         flock_bg_tick();
+        wifi_beacon_tick();
         ble_scan_tick();
+        flipper_remote_bg_tick();
         // The capture service self-stops if USB mass storage takes ownership
         // of the card, so it must receive this tick even in that transition.
         packet_capture_tick();
+        // Spectrum CSV writes are intentionally outside the LVGL timer that
+        // performs the sweep and redraws the waterfall.
+        lora_analyze_bg_tick();
     }
     // Yield to LVGL between SD-heavy batches. The display uses partial
     // refresh with ~6 tiles per screen, one tile per lv_task_handler call;
@@ -2038,10 +2302,40 @@ void loop()
             }
         }
     }
+    // Deep sleep is checked first so a delayed loop never substitutes the
+    // lighter standby state after the configured long-idle deadline.
     if (s_sleep_timeout_ms > 0 &&
-        millis() - s_last_activity_ms >= s_sleep_timeout_ms &&
-        idle_deep_sleep_allowed()) {
-        enter_idle_deep_sleep();
+        millis() - s_last_activity_ms >= s_sleep_timeout_ms) {
+        const char *blocker = idle_deep_sleep_blocker();
+        if (!blocker) {
+            enter_idle_deep_sleep();
+        } else {
+            // A silent blocker made sleep fixes difficult to verify. Report
+            // the active reason at a low rate without spamming the monitor.
+            static uint32_t last_sleep_block_log_ms = 0;
+            uint32_t now = millis();
+            if (now - last_sleep_block_log_ms >= 30000U) {
+                last_sleep_block_log_ms = now;
+                Serial.printf("[Power] deep sleep blocked: %s\n", blocker);
+            }
+        }
+    }
+
+    if (s_standby_timeout_ms > 0 &&
+        millis() - s_last_activity_ms >= s_standby_timeout_ms &&
+        (s_sleep_timeout_ms == 0 ||
+         millis() - s_last_activity_ms < s_sleep_timeout_ms)) {
+        const char *blocker = idle_deep_sleep_blocker();
+        if (!blocker) {
+            enter_idle_light_sleep();
+        } else {
+            static uint32_t last_standby_block_log_ms = 0;
+            const uint32_t now = millis();
+            if (now - last_standby_block_log_ms >= 30000U) {
+                last_standby_block_log_ms = now;
+                Serial.printf("[Power] standby blocked: %s\n", blocker);
+            }
+        }
     }
 
     // 1Hz block also skipped during LVGL priority window - it contains

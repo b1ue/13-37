@@ -33,12 +33,24 @@ struct FlipperHit {
 
 static volatile bool s_running = false;
 static int           s_count   = 0;
+static FlipperDeviceInfo s_last_device = {};
+static bool              s_have_last_device = false;
 static QueueHandle_t s_queue   = nullptr;
+static StaticQueue_t s_queue_state;
+static uint8_t       s_queue_storage[8 * sizeof(FlipperHit)];
+
+static bool ensure_queue()
+{
+    if (!s_queue)
+        s_queue = xQueueCreateStatic(8, sizeof(FlipperHit),
+                                     s_queue_storage, &s_queue_state);
+    return s_queue != nullptr;
+}
 
 // Dedup table. Same shape as the AirTag scanner — Flippers advertise often
 // enough that without this we'd append the same MAC to the log every few
-// seconds. Touched only from the BT task in flipper_check(), no locking
-// needed.
+// seconds. The shared BLE manager dispatches checks on the main loop, so no
+// locking is needed.
 #define FLIPPER_SEEN_SIZE 32
 static struct { uint8_t mac[6]; uint32_t last_ms; } s_seen[FLIPPER_SEEN_SIZE];
 static int s_seen_count = 0;
@@ -78,6 +90,9 @@ static bool seen_recently_or_mark(const uint8_t *mac)
 bool flipper_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
                    const uint8_t *adv, int adv_len)
 {
+    if (!mac6 || !adv || adv_len <= 0) return false;
+    const int max_adv_len = ESP_BLE_ADV_DATA_LEN_MAX + ESP_BLE_SCAN_RSP_DATA_LEN_MAX;
+    if (adv_len > max_adv_len) adv_len = max_adv_len;
     bool name_hit = false;   // local name begins with "Flipper "
     bool uuid_hit = false;   // advertises the Flipper service UUID
     char name[FLIPPER_NAME_MAX] = {0};
@@ -113,9 +128,23 @@ bool flipper_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
     }
 
     if (!name_hit && !uuid_hit) return false;
+
+    // Refresh the connection target on every matched advertisement, even
+    // when the five-minute log deduper suppresses a new hit record.  This
+    // keeps the Remote screen's RSSI/age truthful without spamming the SD log
+    // or incrementing the home badge for the same nearby unit.
+    memcpy(s_last_device.mac, mac6, sizeof(s_last_device.mac));
+    s_last_device.addr_type = addr_type;
+    s_last_device.rssi = rssi;
+    strncpy(s_last_device.name, name[0] ? name : "(uuid 0x3082)",
+            sizeof(s_last_device.name) - 1);
+    s_last_device.name[sizeof(s_last_device.name) - 1] = '\0';
+    s_last_device.seen_ms = millis();
+    s_have_last_device = true;
+
     if (seen_recently_or_mark(mac6)) return false;
 
-    if (!s_queue) s_queue = xQueueCreate(8, sizeof(FlipperHit));
+    if (!ensure_queue()) return false;
 
     FlipperHit hit = {};
     memcpy(hit.mac, mac6, 6);
@@ -126,7 +155,7 @@ bool flipper_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
     else         strncpy(hit.name, "(uuid 0x3082)", sizeof(hit.name) - 1);
     hit.name[sizeof(hit.name) - 1] = '\0';
 
-    if (s_queue) xQueueSend(s_queue, &hit, 0);
+    xQueueSend(s_queue, &hit, 0);
     s_count++;
     return true;
 }
@@ -146,10 +175,8 @@ bool flipper_start()
 {
     if (s_running) return true;
 
-    if (!s_queue) {
-        s_queue = xQueueCreate(8, sizeof(FlipperHit));
-        if (!s_queue) return false;
-    }
+    if (!ensure_queue()) return false;
+    xQueueReset(s_queue);
 
     // Shared BT lifecycle — coexists with wardriver + airtag.
     if (!ble_scan_add(on_scan_result)) return false;
@@ -164,6 +191,7 @@ void flipper_stop()
     if (!s_running) return;
     s_running = false;
     ble_scan_remove(on_scan_result);
+    if (s_queue) xQueueReset(s_queue);
 }
 
 bool flipper_is_running() { return s_running; }
@@ -173,6 +201,19 @@ void flipper_reset_count()
 {
     s_count      = 0;
     s_seen_count = 0;
+}
+
+bool flipper_get_last_device(FlipperDeviceInfo *out)
+{
+    if (!out || !s_have_last_device) return false;
+    *out = s_last_device;
+    return true;
+}
+
+void flipper_clear_last_device()
+{
+    memset(&s_last_device, 0, sizeof(s_last_device));
+    s_have_last_device = false;
 }
 
 void flipper_bg_tick()

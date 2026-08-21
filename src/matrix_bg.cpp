@@ -1,22 +1,37 @@
 #include "matrix_bg.h"
 #include "stock_screen.h"
 #include "theme.h"
+#include "ble_scan_manager.h"
+#include <LilyGoLib.h>
+#include <WiFi.h>
 #include <esp_system.h>   // esp_random
 #include <stdio.h>
 
 #define MX_COLS    22
 #define MX_ROWS    26
 #define MX_COL_W   18     // 22 * 18 = 396 px, centred on the 410 px panel
-#define MX_TICK_MS 120    // opt-in effect; modest rate keeps the QSPI flush sane
+#define MX_DEFAULT_POWER 1
 
 static lv_obj_t  *mx_cont = nullptr;
 static lv_obj_t  *mx_col[MX_COLS];
 static lv_timer_t *mx_timer = nullptr;
 static bool       mx_enabled = false;
 static bool       mx_stock_data = false;
+static bool       mx_system_data = false;
+static uint8_t    mx_power_mode = MX_DEFAULT_POWER;
+static MatrixRainPalette mx_palette = MATRIX_RAIN_GREEN;
 static char       mx_stock_feed[192];
 static size_t     mx_stock_feed_len = 0;
-static uint8_t    mx_stock_refresh_ticks = 0;
+static char       mx_system_feed[192];
+static size_t     mx_system_feed_len = 0;
+static uint32_t   mx_last_data_refresh_ms = 0;
+static uint8_t    mx_next_col = 0;
+
+// Eco and Balanced update half the columns per callback, cutting expensive
+// label invalidations to roughly 25% / 50% of the original animation load.
+// Smooth preserves the original 22-column, 120 ms behavior.
+static const uint16_t MX_POWER_PERIOD_MS[] = { 240, 120, 120 };
+static const uint8_t  MX_POWER_COLS[]      = {  11,  11,  22 };
 
 static int  head[MX_COLS];          // current head row; negative = still entering
 static int  tlen[MX_COLS];          // trail length
@@ -52,12 +67,67 @@ static void refresh_stock_feed()
         ? stock_screen_build_rain_feed(mx_stock_feed, sizeof(mx_stock_feed)) : 0;
 }
 
+static void refresh_system_feed()
+{
+    if (!mx_system_data) {
+        mx_system_feed_len = 0;
+        return;
+    }
+
+    int battery = instance.pmu.getBatteryPercent();
+    if (battery < 0) battery = 0;
+    if (battery > 100) battery = 100;
+    const uint32_t uptime_min = millis() / 60000UL;
+    const uint32_t heap_kb = ESP.getFreeHeap() / 1024UL;
+    const uint32_t psram_kb = ESP.getFreePsram() / 1024UL;
+    const bool wifi_up = WiFi.status() == WL_CONNECTED;
+    const int ble_users = ble_scan_consumer_count();
+    const uint32_t ble_drops = ble_scan_result_drop_count();
+
+    const int n = snprintf(mx_system_feed, sizeof(mx_system_feed),
+        "BAT%03d%s>UP%02luH%02luM>HEAP%luK>PSRAM%luK>WIFI%d>BLE%d>DROP%lu>",
+        battery, instance.pmu.isCharging() ? "CHG" : "",
+        (unsigned long)(uptime_min / 60UL),
+        (unsigned long)(uptime_min % 60UL),
+        (unsigned long)heap_kb, (unsigned long)psram_kb,
+        wifi_up ? 1 : 0, ble_users, (unsigned long)ble_drops);
+    mx_system_feed_len = n > 0
+        ? (size_t)((n < (int)sizeof(mx_system_feed)) ? n : sizeof(mx_system_feed) - 1)
+        : 0;
+}
+
+static void refresh_data_feeds()
+{
+    refresh_stock_feed();
+    refresh_system_feed();
+    mx_last_data_refresh_ms = millis();
+}
+
 static char displayed_glyph(int c, int r)
 {
-    if (!mx_stock_data || mx_stock_feed_len == 0) return cell[c][r];
+    const char *feed = nullptr;
+    size_t feed_len = 0;
+    if (mx_stock_feed_len && mx_system_feed_len) {
+        // Mixed mode deliberately alternates sources by column. It is easier
+        // to read than concatenating feeds and costs no extra rendering work.
+        if ((c & 1) == 0) {
+            feed = mx_system_feed;
+            feed_len = mx_system_feed_len;
+        } else {
+            feed = mx_stock_feed;
+            feed_len = mx_stock_feed_len;
+        }
+    } else if (mx_system_feed_len) {
+        feed = mx_system_feed;
+        feed_len = mx_system_feed_len;
+    } else if (mx_stock_feed_len) {
+        feed = mx_stock_feed;
+        feed_len = mx_stock_feed_len;
+    }
+    if (!feed || feed_len == 0) return cell[c][r];
     // A relatively-prime column stride prevents adjacent trails from showing
     // the same slice. The normal falling head/trail controls movement/shading.
-    return mx_stock_feed[((size_t)c * 17U + (size_t)r) % mx_stock_feed_len];
+    return feed[((size_t)c * 17U + (size_t)r) % feed_len];
 }
 
 static void col_reset(int c)
@@ -89,7 +159,7 @@ static void col_reset(int c)
 // Distance 0 = bright head, increasing distance = dimmer trail.
 static const char *shade(int dist, int len)
 {
-    if (theme_is_blue()) {
+    if (mx_palette == MATRIX_RAIN_BLUE) {
         if (dist == 0)        return "D6EEFF";
         if (dist <= len / 4)  return "66BBFF";
         if (dist <= len / 2)  return "2277DD";
@@ -129,13 +199,17 @@ static void render_col(int c)
 
 static void mx_tick(lv_timer_t *)
 {
-    // Quote data is updated on the LVGL thread too. Refreshing this small
-    // local stream every ~3 seconds picks it up without locking or doing I/O.
-    if (mx_stock_data && ++mx_stock_refresh_ticks >= 25) {
-        mx_stock_refresh_ticks = 0;
-        refresh_stock_feed();
-    }
-    for (int c = 0; c < MX_COLS; c++) {
+    // Refresh cached text every three seconds. This reads only in-memory
+    // state; stock/network fetching and all filesystem I/O remain elsewhere.
+    const uint32_t now = millis();
+    if ((mx_stock_data || mx_system_data) &&
+        now - mx_last_data_refresh_ms >= 3000U)
+        refresh_data_feeds();
+
+    const uint8_t cols = MX_POWER_COLS[mx_power_mode];
+    for (uint8_t i = 0; i < cols; ++i) {
+        const int c = mx_next_col;
+        mx_next_col = (uint8_t)((mx_next_col + 1U) % MX_COLS);
         head[c]++;
         int el = egg_len[c];
         // Skip randomization for cells that hold easter-egg chars
@@ -186,7 +260,8 @@ void matrix_bg_set_enabled(bool en)
     if (!mx_cont) return;
     if (en) {
         lv_obj_clear_flag(mx_cont, LV_OBJ_FLAG_HIDDEN);
-        if (!mx_timer) mx_timer = lv_timer_create(mx_tick, MX_TICK_MS, nullptr);
+        if (!mx_timer)
+            mx_timer = lv_timer_create(mx_tick, MX_POWER_PERIOD_MS[mx_power_mode], nullptr);
     } else {
         lv_obj_add_flag(mx_cont, LV_OBJ_FLAG_HIDDEN);
         if (mx_timer) { lv_timer_del(mx_timer); mx_timer = nullptr; }
@@ -195,16 +270,43 @@ void matrix_bg_set_enabled(bool en)
 
 bool matrix_bg_is_enabled() { return mx_enabled; }
 
+void matrix_bg_set_palette(MatrixRainPalette palette)
+{
+    mx_palette = palette == MATRIX_RAIN_BLUE ? MATRIX_RAIN_BLUE : MATRIX_RAIN_GREEN;
+    matrix_bg_refresh_theme();
+}
+
+MatrixRainPalette matrix_bg_palette() { return mx_palette; }
+
 void matrix_bg_set_stock_data(bool enabled)
 {
     mx_stock_data = enabled;
-    mx_stock_refresh_ticks = 0;
-    refresh_stock_feed();
+    refresh_data_feeds();
     if (!mx_cont || !mx_enabled) return;
     for (int c = 0; c < MX_COLS; ++c) render_col(c);
 }
 
 bool matrix_bg_stock_data_enabled() { return mx_stock_data; }
+
+void matrix_bg_set_system_data(bool enabled)
+{
+    mx_system_data = enabled;
+    refresh_data_feeds();
+    if (!mx_cont || !mx_enabled) return;
+    for (int c = 0; c < MX_COLS; ++c) render_col(c);
+}
+
+bool matrix_bg_system_data_enabled() { return mx_system_data; }
+
+void matrix_bg_set_power_mode(uint8_t mode)
+{
+    if (mode > 2) mode = MX_DEFAULT_POWER;
+    mx_power_mode = mode;
+    mx_next_col = 0;
+    if (mx_timer) lv_timer_set_period(mx_timer, MX_POWER_PERIOD_MS[mx_power_mode]);
+}
+
+uint8_t matrix_bg_power_mode() { return mx_power_mode; }
 
 void matrix_bg_set_paused(bool paused)
 {

@@ -1,5 +1,6 @@
 #include "hostresolve.h"
 #include "pingsweep.h"
+#include "service_discovery.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <string.h>
@@ -788,10 +789,14 @@ static void resolve_task(void *)
     s_stats.pass = HRPASS_OUI;
     oui_pass_run();
 
+    s_stats.pass = HRPASS_SERVICES;
+    s_stats.service_replies = service_discovery_run();
+
     s_stats.pass = HRPASS_DONE;
-    HR_LOG("[HR] hostresolve: done (mdns=%u nbns=%u dns=%u oui=%u)\n",
+    HR_LOG("[HR] hostresolve: done (mdns=%u nbns=%u dns=%u oui=%u services=%u)\n",
           (unsigned)s_stats.mdns_named, (unsigned)s_stats.nbns_named,
-          (unsigned)s_stats.dns_named, (unsigned)s_stats.oui_named);
+          (unsigned)s_stats.dns_named, (unsigned)s_stats.oui_named,
+          (unsigned)s_stats.service_replies);
 
     s_running = false;
     vTaskDelete(NULL);

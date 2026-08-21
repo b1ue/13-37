@@ -1,5 +1,4 @@
 #include "flock.h"
-#include "wifi_beacon_manager.h"
 
 void clock_screen_get_local_time(struct tm *out);
 void clock_screen_show_flock_alert(const char *vendor, const char *confidence,
@@ -221,17 +220,14 @@ bool flock_check(const uint8_t *mac6, int8_t rssi, const char *name, char source
 
 enum FlockRunState : uint8_t {
     FLOCK_STOPPED,
-    FLOCK_START_WIFI,
     FLOCK_START_BLE,
     FLOCK_RUNNING,
-    FLOCK_STOP_WIFI,
     FLOCK_STOP_BLE,
     FLOCK_FAILED,
 };
 
 static volatile bool s_flock_running = false;
 static FlockRunState s_run_state = FLOCK_STOPPED;
-static bool s_wifi_registered = false;
 static bool s_ble_registered = false;
 static volatile uint32_t s_observation_drops = 0;
 
@@ -259,11 +255,6 @@ static bool enqueue_observation(const uint8_t *mac6, int8_t rssi,
         return false;
     }
     return true;
-}
-
-static void flock_beacon_cb(const WifiBeacon *b)
-{
-    enqueue_observation(b->bssid, b->rssi, b->ssid, 'W');
 }
 
 static void flock_ble_cb(esp_ble_gap_cb_param_t *param)
@@ -296,7 +287,7 @@ static void flock_ble_cb(esp_ble_gap_cb_param_t *param)
 bool flock_start()
 {
     if (s_flock_running) return true;
-    if (s_run_state == FLOCK_STOP_WIFI || s_run_state == FLOCK_STOP_BLE)
+    if (s_run_state == FLOCK_STOP_BLE)
         return false;
 
     // Allocate before either radio callback can run. Radio tasks only copy a
@@ -315,11 +306,10 @@ bool flock_start()
 
     xQueueReset(s_observation_queue);
     s_observation_drops = 0;
-    s_wifi_registered = false;
     s_ble_registered = false;
     s_flock_running = true;
-    s_run_state = FLOCK_START_WIFI;
-    Serial.println("[Flock] start requested; staging WiFi then BLE");
+    s_run_state = FLOCK_START_BLE;
+    Serial.println("[Flock] start requested; staging passive BLE");
     return true;
 }
 
@@ -330,8 +320,7 @@ void flock_stop()
     // The old path tore both controllers down inside the tile's CLICKED
     // callback. Stage each unregister on later loop passes so the next touch
     // or hardware-button event cannot collide with controller teardown.
-    if (s_wifi_registered) s_run_state = FLOCK_STOP_WIFI;
-    else if (s_ble_registered) s_run_state = FLOCK_STOP_BLE;
+    if (s_ble_registered) s_run_state = FLOCK_STOP_BLE;
     else s_run_state = FLOCK_STOPPED;
 }
 
@@ -341,10 +330,6 @@ void flock_prepare_for_sleep()
     // immediately. The BLE manager's final hardware shutdown remains async;
     // ESP deep sleep powers the controller domain down moments later.
     s_flock_running = false;
-    if (s_wifi_registered) {
-        wifi_beacon_remove(flock_beacon_cb);
-        s_wifi_registered = false;
-    }
     if (s_ble_registered) {
         ble_scan_remove(flock_ble_cb);
         s_ble_registered = false;
@@ -356,21 +341,17 @@ void flock_prepare_for_sleep()
 bool flock_is_running() { return s_flock_running; }
 bool flock_is_starting()
 {
-    return s_run_state == FLOCK_START_WIFI || s_run_state == FLOCK_START_BLE;
+    return s_run_state == FLOCK_START_BLE;
 }
 bool flock_is_stopping()
 {
-    return s_run_state == FLOCK_STOP_WIFI || s_run_state == FLOCK_STOP_BLE;
+    return s_run_state == FLOCK_STOP_BLE;
 }
 const char *flock_status_text()
 {
     switch (s_run_state) {
-    case FLOCK_START_WIFI: return "Starting WiFi";
     case FLOCK_START_BLE:  return "Starting BLE";
-    case FLOCK_RUNNING:
-        if (s_wifi_registered && s_ble_registered) return "WiFi + BLE";
-        return s_wifi_registered ? "WiFi only" : "BLE only";
-    case FLOCK_STOP_WIFI: return "Stopping WiFi";
+    case FLOCK_RUNNING:    return "BLE passive";
     case FLOCK_STOP_BLE:  return "Stopping BLE";
     case FLOCK_FAILED:     return "Start failed";
     default:               return "Stopped";
@@ -392,14 +373,6 @@ void flock_reset_count()
 
 void flock_bg_tick()
 {
-    if (s_run_state == FLOCK_STOP_WIFI) {
-        if (s_wifi_registered) {
-            wifi_beacon_remove(flock_beacon_cb);
-            s_wifi_registered = false;
-        }
-        s_run_state = s_ble_registered ? FLOCK_STOP_BLE : FLOCK_STOPPED;
-        return;
-    }
     if (s_run_state == FLOCK_STOP_BLE) {
         if (s_ble_registered) {
             ble_scan_remove(flock_ble_cb);
@@ -412,23 +385,16 @@ void flock_bg_tick()
         return;
     }
 
-    // Bring the two radios up on separate main-loop passes. Each manager can
-    // take noticeable time to initialize; separating them guarantees an LVGL
-    // refresh between operations and prevents the tile callback from doing
-    // any controller work.
-    if (s_flock_running && s_run_state == FLOCK_START_WIFI) {
-        s_wifi_registered = wifi_beacon_add(flock_beacon_cb);
-        s_run_state = FLOCK_START_BLE;
-        Serial.printf("[Flock] WiFi stage: %s\n",
-                      s_wifi_registered ? "ready" : "unavailable");
-        return;
-    }
+    // Register on a later loop pass, never inside the tile callback. The BLE
+    // manager then initializes/reuses the controller asynchronously. WiFi
+    // observations still arrive through Wardriver's shared callback when it
+    // is running; Flock no longer cold-starts promiscuous WiFi by itself.
     if (s_flock_running && s_run_state == FLOCK_START_BLE) {
         s_ble_registered = ble_scan_add(flock_ble_cb);
-        if (!s_wifi_registered && !s_ble_registered) {
+        if (!s_ble_registered) {
             s_flock_running = false;
             s_run_state = FLOCK_FAILED;
-            Serial.println("[Flock] start failed: both radios unavailable");
+            Serial.println("[Flock] start failed: BLE consumer table full");
             return;
         }
         s_run_state = FLOCK_RUNNING;

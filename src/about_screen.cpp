@@ -1,4 +1,5 @@
 #include "about_screen.h"
+#include "firmware_version.h"
 #include "theme.h"
 
 void tools_screen_show();
@@ -65,6 +66,15 @@ static void create_screen()
     make_credit(s_screen, "UPSTREAM AUTHOR", "@r3dfish", 94);
     make_credit(s_screen, "OPTIMIZED FORK", "@b1ue", 180);
 
+    lv_obj_t *version = lv_label_create(s_screen);
+    lv_obj_set_width(version, 390);
+    lv_obj_set_style_text_align(version, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(version, theme_accent_bright(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(version, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_label_set_text_fmt(version, "Firmware v%s\n%s  |  build %s",
+                          FW_VERSION, FW_FEATURE_SET, FW_BUILD_ID);
+    lv_obj_align(version, LV_ALIGN_TOP_MID, 0, 276);
+
     lv_obj_t *repo = lv_label_create(s_screen);
     lv_obj_set_width(repo, 360);
     lv_obj_set_style_text_align(repo, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -74,13 +84,13 @@ static void create_screen()
         "13:37 for LILYGO T-Watch Ultra\n"
         "github.com/b1ue/13-37\n"
         "MIT License");
-    lv_obj_align(repo, LV_ALIGN_TOP_MID, 0, 278);
+    lv_obj_align(repo, LV_ALIGN_TOP_MID, 0, 332);
 
     lv_obj_t *hint = lv_label_create(s_screen);
     lv_label_set_text(hint, "BOOT or swipe up to return to Tools");
     lv_obj_set_style_text_color(hint, lv_color_make(0x66, 0x66, 0x66), LV_PART_MAIN);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
 
     lv_obj_add_event_cb(s_screen, on_gesture, LV_EVENT_GESTURE, nullptr);
 }

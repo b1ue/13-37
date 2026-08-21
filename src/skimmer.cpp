@@ -30,9 +30,19 @@ struct SkimmerHit {
 static volatile bool s_running = false;
 static int           s_count   = 0;
 static QueueHandle_t s_queue   = nullptr;
+static StaticQueue_t s_queue_state;
+static uint8_t       s_queue_storage[8 * sizeof(SkimmerHit)];
 
-// Dedup table — same shape as the AirTag / Flipper scanners. Touched only
-// from the BT task in skimmer_check(), no locking needed.
+static bool ensure_queue()
+{
+    if (!s_queue)
+        s_queue = xQueueCreateStatic(8, sizeof(SkimmerHit),
+                                     s_queue_storage, &s_queue_state);
+    return s_queue != nullptr;
+}
+
+// Dedup table — same shape as the AirTag / Flipper scanners. The shared BLE
+// manager dispatches checks on the main loop, so no locking is needed.
 #define SKIMMER_SEEN_SIZE 32
 static struct { uint8_t mac[6]; uint32_t last_ms; } s_seen[SKIMMER_SEEN_SIZE];
 static int s_seen_count = 0;
@@ -68,6 +78,9 @@ static bool seen_recently_or_mark(const uint8_t *mac)
 bool skimmer_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
                    const uint8_t *adv, int adv_len)
 {
+    if (!mac6 || !adv || adv_len <= 0) return false;
+    const int max_adv_len = ESP_BLE_ADV_DATA_LEN_MAX + ESP_BLE_SCAN_RSP_DATA_LEN_MAX;
+    if (adv_len > max_adv_len) adv_len = max_adv_len;
     for (int pos = 0; pos < adv_len; ) {
         uint8_t seg_len = adv[pos];
         if (seg_len == 0) break;
@@ -90,7 +103,7 @@ bool skimmer_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
 
             if (seen_recently_or_mark(mac6)) return false;
 
-            if (!s_queue) s_queue = xQueueCreate(8, sizeof(SkimmerHit));
+            if (!ensure_queue()) return false;
 
             SkimmerHit hit = {};
             memcpy(hit.mac, mac6, 6);
@@ -101,7 +114,7 @@ bool skimmer_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
             memcpy(hit.name, ad_data, name_len);
             hit.name[name_len] = '\0';
 
-            if (s_queue) xQueueSend(s_queue, &hit, 0);
+            xQueueSend(s_queue, &hit, 0);
             s_count++;
             return true;
         }
@@ -123,10 +136,8 @@ bool skimmer_start()
 {
     if (s_running) return true;
 
-    if (!s_queue) {
-        s_queue = xQueueCreate(8, sizeof(SkimmerHit));
-        if (!s_queue) return false;
-    }
+    if (!ensure_queue()) return false;
+    xQueueReset(s_queue);
 
     // Shared BT lifecycle — coexists with wardriver + airtag + flipper.
     if (!ble_scan_add(on_scan_result)) return false;
@@ -141,6 +152,7 @@ void skimmer_stop()
     if (!s_running) return;
     s_running = false;
     ble_scan_remove(on_scan_result);
+    if (s_queue) xQueueReset(s_queue);
 }
 
 bool skimmer_is_running() { return s_running; }

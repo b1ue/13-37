@@ -24,7 +24,11 @@ static volatile bool     s_abort        = false;
 static bool              s_logged       = false;
 static volatile bool     s_just_finished = false;
 
-static uint8_t s_net_a, s_net_b, s_net_c;   // /24 prefix being swept
+static uint32_t s_network = 0;               // host-order IPv4
+static uint32_t s_broadcast = 0;
+static uint8_t  s_prefix_len = 24;
+static bool     s_limited = false;
+static uint32_t s_targets[PINGSWEEP_MAX_TARGETS];
 static char    s_ssid[33];
 
 // Per-host ping result, shared between the esp_ping callbacks and sweep_task.
@@ -51,11 +55,16 @@ static void on_ping_end(esp_ping_handle_t hdl, void *args)
 
 // Best-effort MAC lookup: the host was just pinged, so it is still fresh in
 // the lwIP ARP cache.
-static void lookup_mac(uint8_t a, uint8_t b, uint8_t c, uint8_t d, PingDevice *dev)
+static uint32_t lwip_order(uint32_t ip)
+{
+    return ((ip >> 24) & 0xFFU) | ((ip >> 8) & 0xFF00U) |
+           ((ip << 8) & 0xFF0000U) | ((ip << 24) & 0xFF000000U);
+}
+
+static void lookup_mac(uint32_t host_ip, PingDevice *dev)
 {
     dev->has_mac = false;
-    uint32_t want = (uint32_t)a | ((uint32_t)b << 8)
-                  | ((uint32_t)c << 16) | ((uint32_t)d << 24);   // network order
+    uint32_t want = lwip_order(host_ip);
     for (int i = 0; i < 32; i++) {
         ip4_addr_t      *ip  = nullptr;
         struct netif    *nif = nullptr;
@@ -73,15 +82,14 @@ static void lookup_mac(uint8_t a, uint8_t b, uint8_t c, uint8_t d, PingDevice *d
 
 static void sweep_task(void *)
 {
-    for (int d = 1; d <= 254 && !s_abort; d++) {
+    for (int target = 0; target < s_total && !s_abort; target++) {
         s_cur_alive = false;
         s_cur_rtt   = 0;
 
         ip_addr_t addr;
         memset(&addr, 0, sizeof(addr));
         addr.type = IPADDR_TYPE_V4;
-        addr.u_addr.ip4.addr = (uint32_t)s_net_a | ((uint32_t)s_net_b << 8)
-                             | ((uint32_t)s_net_c << 16) | ((uint32_t)d << 24);
+        addr.u_addr.ip4.addr = lwip_order(s_targets[target]);
 
         esp_ping_config_t cfg;
         memset(&cfg, 0, sizeof(cfg));
@@ -106,10 +114,9 @@ static void sweep_task(void *)
         if (s_cur_alive && s_device_count < PINGSWEEP_MAX_DEVICES) {
             PingDevice dev;
             memset(&dev, 0, sizeof(dev));
-            dev.ip = ((uint32_t)s_net_a << 24) | ((uint32_t)s_net_b << 16)
-                   | ((uint32_t)s_net_c << 8)  | (uint32_t)d;
+            dev.ip = s_targets[target];
             dev.rtt_ms = s_cur_rtt;
-            lookup_mac(s_net_a, s_net_b, s_net_c, (uint8_t)d, &dev);
+            lookup_mac(dev.ip, &dev);
             s_devices[s_device_count] = dev;
             s_device_count = s_device_count + 1;   // publish last (UI reads count)
         }
@@ -145,8 +152,10 @@ static void write_log()
 
     f.printf("Ping sweep  %04d-%02d-%02d %02d:%02d:%02d\n",
         t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-    f.printf("Network: %u.%u.%u.0/24   SSID \"%s\"\n",
-        s_net_a, s_net_b, s_net_c, s_ssid);
+    f.printf("Network: %u.%u.%u.%u/%u   SSID \"%s\"%s\n",
+        (s_network >> 24) & 0xFF, (s_network >> 16) & 0xFF,
+        (s_network >> 8) & 0xFF, s_network & 0xFF, s_prefix_len, s_ssid,
+        s_limited ? "   (bounded sample)" : "");
     f.printf("Devices found: %d\n\n", s_device_count);
 
     for (int i = 0; i < s_device_count; i++) {
@@ -169,7 +178,57 @@ static void write_log()
                 (d.name_source == PNAME_OUI)  ? "oui"  : "?";
             f.printf("\t%s\t%s", src, d.name);
         }
+        if (d.services[0]) f.printf("\tservices\t%s", d.services);
         f.print("\n");
+    }
+    f.close();
+}
+
+static void csv_field(File &f, const char *text)
+{
+    f.print('"');
+    for (const char *p = text ? text : ""; *p; ++p) {
+        if (*p == '"') f.print("\"\"");
+        else if (*p != '\r' && *p != '\n') f.print(*p);
+    }
+    f.print('"');
+}
+
+// Append a resolved snapshot to a durable evidence table. Keeping separate
+// mDNS/NBNS/PTR/OUI fields lets later desktop analysis correlate a device
+// even when its IP or preferred display name changes between sweeps.
+static void write_profiles()
+{
+    if (usb_sd_is_running() || !instance.isCardReady()) return;
+    if (!SD.exists("/Network")) SD.mkdir("/Network");
+    const char *path = "/Network/host_profiles.csv";
+    const bool add_header = !SD.exists(path);
+    File f = SD.open(path, FILE_APPEND);
+    if (!f) return;
+    if (add_header)
+        f.println("timestamp,ssid,ip,mac,rtt_ms,preferred,mdns,nbns,ptr,vendor,services");
+
+    struct tm t = {};
+    clock_screen_get_local_time(&t);
+    char stamp[24];
+    snprintf(stamp, sizeof(stamp), "%04d-%02d-%02dT%02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    for (int i = 0; i < s_device_count; ++i) {
+        const PingDevice &d = s_devices[i];
+        char ipbuf[16], macbuf[18] = "";
+        snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+            (d.ip >> 24) & 0xFF, (d.ip >> 16) & 0xFF,
+            (d.ip >> 8) & 0xFF, d.ip & 0xFF);
+        if (d.has_mac)
+            snprintf(macbuf, sizeof(macbuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                d.mac[0], d.mac[1], d.mac[2], d.mac[3], d.mac[4], d.mac[5]);
+        csv_field(f, stamp); f.print(','); csv_field(f, s_ssid); f.print(',');
+        csv_field(f, ipbuf); f.print(','); csv_field(f, macbuf);
+        f.printf(",%lu,", (unsigned long)d.rtt_ms);
+        csv_field(f, d.name); f.print(','); csv_field(f, d.mdns); f.print(',');
+        csv_field(f, d.nbns); f.print(','); csv_field(f, d.ptr); f.print(',');
+        csv_field(f, d.vendor); f.print(','); csv_field(f, d.services); f.println();
     }
     f.close();
 }
@@ -182,16 +241,47 @@ void pingsweep_start()
     if (WiFi.status() != WL_CONNECTED) return;
 
     IPAddress ip = WiFi.localIP();
-    s_net_a = ip[0];
-    s_net_b = ip[1];
-    s_net_c = ip[2];
+    IPAddress mask = WiFi.subnetMask();
+    const uint32_t local = ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) |
+                           ((uint32_t)ip[2] << 8) | ip[3];
+    const uint32_t netmask = ((uint32_t)mask[0] << 24) | ((uint32_t)mask[1] << 16) |
+                             ((uint32_t)mask[2] << 8) | mask[3];
+    s_network = local & netmask;
+    s_broadcast = s_network | ~netmask;
+    s_prefix_len = 0;
+    for (uint32_t bit = 0x80000000U; bit && (netmask & bit); bit >>= 1)
+        ++s_prefix_len;
+
+    const uint64_t usable = s_broadcast > s_network + 1U
+        ? (uint64_t)s_broadcast - s_network - 1ULL : 0ULL;
+    s_limited = usable > PINGSWEEP_MAX_TARGETS;
+    uint32_t first = s_network + 1U;
+    uint32_t last = s_broadcast - 1U;
+    if (s_limited) {
+        const uint32_t half = PINGSWEEP_MAX_TARGETS / 2U;
+        first = local > half ? local - half : s_network + 1U;
+        if (first < s_network + 1U) first = s_network + 1U;
+        last = first + PINGSWEEP_MAX_TARGETS;
+        if (last > s_broadcast - 1U) {
+            last = s_broadcast - 1U;
+            first = last - PINGSWEEP_MAX_TARGETS;
+        }
+    }
+    s_total = 0;
+    if (usable > 0) {
+        for (uint32_t candidate = first;
+             candidate <= last && s_total < PINGSWEEP_MAX_TARGETS;
+             ++candidate) {
+            if (candidate != local) s_targets[s_total++] = candidate;
+            if (candidate == 0xFFFFFFFFU) break;
+        }
+    }
     String ss = WiFi.SSID();
     strncpy(s_ssid, ss.c_str(), sizeof(s_ssid) - 1);
     s_ssid[sizeof(s_ssid) - 1] = '\0';
 
     s_device_count  = 0;
     s_scanned       = 0;
-    s_total         = 254;
     s_done          = false;
     s_abort         = false;
     s_logged        = false;
@@ -214,10 +304,11 @@ bool pingsweep_is_running() { return s_running; }
 
 void pingsweep_poll()
 {
-    if (!s_done || s_logged) return;
+    if (!s_done || s_logged || hostresolve_is_running()) return;
     s_logged        = true;
     s_just_finished = true;
     write_log();
+    write_profiles();
 }
 
 int pingsweep_scanned()      { return s_scanned; }
@@ -234,7 +325,16 @@ void pingsweep_set_name(int idx, const char *name, uint8_t src)
 {
     if (idx < 0 || idx >= s_device_count) return;
     if (src == PNAME_NONE || !name || !name[0]) return;
-    // Don't overwrite a more-authoritative name with a weaker one.
+    char *evidence = nullptr;
+    if (src == PNAME_MDNS) evidence = s_devices[idx].mdns;
+    else if (src == PNAME_NBNS) evidence = s_devices[idx].nbns;
+    else if (src == PNAME_PTR) evidence = s_devices[idx].ptr;
+    else if (src == PNAME_OUI) evidence = s_devices[idx].vendor;
+    if (evidence) {
+        strncpy(evidence, name, PINGSWEEP_EVIDENCE_MAX - 1);
+        evidence[PINGSWEEP_EVIDENCE_MAX - 1] = '\0';
+    }
+    // Don't overwrite a more-authoritative display name with a weaker one.
     // Ranking (high → low): MDNS=4, NBNS=3, PTR=2, OUI=1, NONE=0.
     static const uint8_t rank_of[] = { 0, 4, 3, 2, 1 }; // index = PingNameSource
     uint8_t cur = s_devices[idx].name_source;
@@ -246,6 +346,30 @@ void pingsweep_set_name(int idx, const char *name, uint8_t src)
     s_devices[idx].name[PINGSWEEP_NAME_MAX - 1] = '\0';
     s_devices[idx].name_source = src;
 }
+
+void pingsweep_add_service_for_ip(uint32_t ip, const char *service)
+{
+    if (!service || !service[0]) return;
+    for (int i = 0; i < s_device_count; ++i) {
+        PingDevice &d = s_devices[i];
+        if (d.ip != ip || strstr(d.services, service)) continue;
+        const size_t used = strlen(d.services);
+        if (used && used + 2 < sizeof(d.services)) strcat(d.services, ", ");
+        strncat(d.services, service, sizeof(d.services) - strlen(d.services) - 1);
+        return;
+    }
+}
+
+void pingsweep_network_cidr(char *out, size_t size)
+{
+    if (!out || size == 0) return;
+    snprintf(out, size, "%u.%u.%u.%u/%u%s",
+        (s_network >> 24) & 0xFF, (s_network >> 16) & 0xFF,
+        (s_network >> 8) & 0xFF, s_network & 0xFF, s_prefix_len,
+        s_limited ? " sample" : "");
+}
+
+bool pingsweep_is_limited() { return s_limited; }
 
 bool pingsweep_just_finished()
 {

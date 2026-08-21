@@ -8,6 +8,9 @@
 
 void lora_analyze_screen_create();
 void lora_analyze_screen_show();
+// Open directly from Tools; swipe-right returns to Tools instead of the
+// Bluetooth analyzer in the three-screen Analyze chain.
+void lora_analyze_screen_show_direct();
 bool lora_analyze_screen_is_active();
 
 // True while the analyzer is claiming the SX1262 — main.cpp's
@@ -21,3 +24,7 @@ bool lora_analyze_is_running();
 // main.cpp invokes this so exiting via the boot button doesn't leave the
 // radio in standby with pager/tpms/aprs silently dropped.
 void lora_analyze_screen_stop();
+
+// Flush an optional completed sweep to /Spectrum without doing SD work from
+// the LVGL timer. Call from the normal main loop.
+void lora_analyze_bg_tick();

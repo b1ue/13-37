@@ -24,5 +24,19 @@ void flipper_reset_count();   // zero the count + dedup table (per-session reset
 bool flipper_check(const uint8_t *mac6, int8_t rssi, uint8_t addr_type,
                    const uint8_t *adv, int adv_len);
 
+// Most recently accepted Flipper advertisement.  This is intentionally held
+// in RAM only: BLE addresses can be privacy-sensitive and the controller does
+// not need a permanent device identifier.  The remote screen uses this record
+// as its explicit connection target.
+struct FlipperDeviceInfo {
+    uint8_t mac[6];
+    uint8_t addr_type;
+    int8_t  rssi;
+    char    name[33];
+    uint32_t seen_ms;
+};
+bool flipper_get_last_device(FlipperDeviceInfo *out);
+void flipper_clear_last_device();
+
 // Drains queued detections and writes them to the SD card. Call from loop().
 void flipper_bg_tick();

@@ -41,11 +41,19 @@ static int       bar_x[N_CHANNELS];   // x position of each bar (constant)
 static volatile uint32_t s_cur_pkts     = 0;
 static volatile uint32_t s_cur_bytes    = 0;
 static volatile int8_t   s_cur_max_rssi = -127;
+static volatile int32_t  s_cur_rssi_sum = 0;
+static volatile uint32_t s_cur_rssi_samples = 0;
+static volatile uint32_t s_cur_mgmt = 0, s_cur_ctrl = 0, s_cur_data = 0;
+static volatile uint64_t s_cur_ap_bitmap = 0;
 
 struct ChanStat {
     float    pps;              // packets per second, EMA-smoothed
     int8_t   peak_rssi;        // peak RSSI ever seen on this channel
     uint32_t pkt_total;        // cumulative packet count
+    uint32_t frame_total[3];   // management/control/data activity
+    uint16_t ap_count;         // approximate unique beacon/probe BSSIDs
+    int8_t   avg_rssi;
+    uint64_t ap_bitmap;
 };
 static ChanStat s_chan[N_CHANNELS];
 
@@ -63,12 +71,29 @@ static wifi_mode_t s_prev_wifi_mode = WIFI_MODE_NULL;
 
 static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
-    (void)type;
     const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
     s_cur_pkts++;
     s_cur_bytes += p->rx_ctrl.sig_len;
     int8_t r = p->rx_ctrl.rssi;
     if (r > s_cur_max_rssi) s_cur_max_rssi = r;
+    s_cur_rssi_sum += r;
+    ++s_cur_rssi_samples;
+    if (type == WIFI_PKT_MGMT) ++s_cur_mgmt;
+    else if (type == WIFI_PKT_CTRL) ++s_cur_ctrl;
+    else if (type == WIFI_PKT_DATA) ++s_cur_data;
+
+    // Beacon/probe-response BSSID presence. A 64-bit hash bitmap gives a
+    // stable, bounded AP estimate without allocating or locking a table in
+    // the promiscuous callback.
+    if (type == WIFI_PKT_MGMT && p->rx_ctrl.sig_len >= 24) {
+        const uint8_t subtype = (p->payload[0] >> 4) & 0x0F;
+        if (subtype == 8 || subtype == 5) {
+            const uint8_t *bssid = &p->payload[16];
+            uint8_t hash = 0;
+            for (int i = 0; i < 6; ++i) hash = (uint8_t)(hash * 33U + bssid[i]);
+            s_cur_ap_bitmap |= (1ULL << (hash & 63U));
+        }
+    }
 }
 
 static void start_analysis()
@@ -84,6 +109,10 @@ static void start_analysis()
     s_cur_pkts     = 0;
     s_cur_bytes    = 0;
     s_cur_max_rssi = -127;
+    s_cur_rssi_sum = 0;
+    s_cur_rssi_samples = 0;
+    s_cur_mgmt = s_cur_ctrl = s_cur_data = 0;
+    s_cur_ap_bitmap = 0;
     s_total_pkts   = 0;
 
     WiFi.mode(WIFI_STA);
@@ -142,15 +171,29 @@ static void refresh()
         // Snapshot + reset the per-channel counters, then advance.
         uint32_t pkts  = s_cur_pkts;
         int8_t   rssi  = s_cur_max_rssi;
+        int32_t rssi_sum = s_cur_rssi_sum;
+        uint32_t rssi_samples = s_cur_rssi_samples;
+        uint32_t mgmt = s_cur_mgmt, ctrl = s_cur_ctrl, data = s_cur_data;
+        uint64_t aps = s_cur_ap_bitmap;
         s_cur_pkts     = 0;
         s_cur_bytes    = 0;
         s_cur_max_rssi = -127;
+        s_cur_rssi_sum = 0;
+        s_cur_rssi_samples = 0;
+        s_cur_mgmt = s_cur_ctrl = s_cur_data = 0;
+        s_cur_ap_bitmap = 0;
 
         int idx = s_cur_ch - 1;
         float secs = elapsed / 1000.0f;
         float pps_new = (secs > 0.001f) ? (pkts / secs) : 0;
         s_chan[idx].pps        = s_chan[idx].pps * 0.6f + pps_new * 0.4f;
         s_chan[idx].pkt_total += pkts;
+        s_chan[idx].frame_total[0] += mgmt;
+        s_chan[idx].frame_total[1] += ctrl;
+        s_chan[idx].frame_total[2] += data;
+        s_chan[idx].ap_bitmap |= aps;
+        s_chan[idx].ap_count = (uint16_t)__builtin_popcountll(s_chan[idx].ap_bitmap);
+        if (rssi_samples) s_chan[idx].avg_rssi = (int8_t)(rssi_sum / (int32_t)rssi_samples);
         if (rssi > s_chan[idx].peak_rssi) s_chan[idx].peak_rssi = rssi;
         s_total_pkts          += pkts;
 
@@ -189,8 +232,9 @@ static void refresh()
     int idx_active = s_cur_ch - 1;
     if (s_chan[idx_active].peak_rssi > -127) {
         lv_label_set_text_fmt(status_label,
-            "ch %d  %.0f pkt/s  peak %d dBm   total %lu",
-            s_cur_ch, s_chan[idx_active].pps,
+            "CH%d  AP~%u  %.0f/s  RSSI %d/%d  total %lu",
+            s_cur_ch, s_chan[idx_active].ap_count, s_chan[idx_active].pps,
+            (int)s_chan[idx_active].avg_rssi,
             (int)s_chan[idx_active].peak_rssi,
             (unsigned long)s_total_pkts);
     } else {
@@ -199,14 +243,27 @@ static void refresh()
             s_cur_ch, (unsigned long)s_total_pkts);
     }
 
-    // Hint at the bottom: the least-busy channel candidate.
-    int quietest = 0;
-    float qp = s_chan[0].pps;
-    for (int i = 1; i < N_CHANNELS; i++) if (s_chan[i].pps < qp) { qp = s_chan[i].pps; quietest = i; }
+    // Recommend among non-overlapping 2.4 GHz channels using both observed
+    // frame activity and adjacent-channel AP pressure.
+    const int candidates[] = { 1, 6, 11 };
+    int recommended = 1;
+    float recommendation_score = 1.0e30f;
+    for (int candidate : candidates) {
+        float score = 0;
+        for (int ch = 1; ch <= N_CHANNELS; ++ch) {
+            int distance = abs(ch - candidate);
+            float weight = distance == 0 ? 1.0f : distance == 1 ? 0.65f : distance == 2 ? 0.30f : 0.0f;
+            score += weight * (s_chan[ch - 1].pps + 5.0f * s_chan[ch - 1].ap_count);
+        }
+        if (score < recommendation_score) { recommendation_score = score; recommended = candidate; }
+    }
     lv_label_set_text_fmt(legend_label,
-        "quiet ch %d: %.0f/s   busy ch %d: %.0f/s\n"
-        "passive all-frame sample - 150 ms/channel",
-        quietest + 1, qp, best_ch, best_pps < 0 ? 0 : best_pps);
+        "USE CH%d  score %.0f   busy CH%d %.0f/s\n"
+        "frames M%lu C%lu D%lu - passive 150 ms/channel",
+        recommended, recommendation_score, best_ch, best_pps < 0 ? 0 : best_pps,
+        (unsigned long)s_chan[idx_active].frame_total[0],
+        (unsigned long)s_chan[idx_active].frame_total[1],
+        (unsigned long)s_chan[idx_active].frame_total[2]);
 }
 
 static void on_timer(lv_timer_t *) { refresh(); }

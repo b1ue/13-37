@@ -15,11 +15,13 @@ static lv_obj_t *s_screen;
 static lv_obj_t *s_status;
 static lv_obj_t *s_start_label;
 static lv_obj_t *s_channel_label;
+static lv_obj_t *s_filter_label;
 static lv_obj_t *s_stats;
 static lv_obj_t *s_bars[13];
 static lv_obj_t *s_rows[4];
 static lv_obj_t *s_detail;
 static int s_selected = 0;
+static uint8_t s_filter_preset = 0;
 
 static const char *subtype_name(uint8_t subtype)
 {
@@ -108,9 +110,10 @@ static void refresh()
     const uint8_t setting = packet_capture_get_channel();
     snprintf(buffer, sizeof(buffer), setting ? "CH %u" : "HOP");
     lv_label_set_text(s_channel_label, buffer);
-    snprintf(buffer, sizeof(buffer), "%lu pkt  %lu/s  %lu drop  tuned CH%u",
+    snprintf(buffer, sizeof(buffer), "%lu pkt  %lu/s  %lu filt  %lu drop  CH%u",
              static_cast<unsigned long>(packet_capture_total()),
              static_cast<unsigned long>(packet_capture_packets_per_second()),
+             static_cast<unsigned long>(packet_capture_rejected()),
              static_cast<unsigned long>(packet_capture_dropped()),
              packet_capture_current_channel());
     lv_label_set_text(s_stats, buffer);
@@ -171,6 +174,33 @@ static void on_channel(lv_event_t *)
     refresh();
 }
 
+static void on_filter(lv_event_t *)
+{
+    s_filter_preset = (s_filter_preset + 1U) % 6U;
+    packet_capture_clear_mac_filter();
+    packet_capture_set_min_rssi(-127);
+    packet_capture_set_subtype_mask(0xFFFFU);
+    const char *label = "ALL";
+    if (s_filter_preset == 1) {
+        packet_capture_set_subtype_mask(1U << 8); label = "BEACON";
+    } else if (s_filter_preset == 2) {
+        packet_capture_set_subtype_mask((1U << 4) | (1U << 5)); label = "PROBE";
+    } else if (s_filter_preset == 3) {
+        packet_capture_set_subtype_mask((1U << 11) | (1U << 12)); label = "AUTH";
+    } else if (s_filter_preset == 4) {
+        packet_capture_set_min_rssi(-70); label = ">-70";
+    } else if (s_filter_preset == 5) {
+        PacketCaptureView packet = {};
+        if (packet_capture_get_recent(s_selected, &packet)) {
+            packet_capture_set_mac_filter(packet.addr3); label = "BSSID";
+        } else {
+            s_filter_preset = 0;
+        }
+    }
+    lv_label_set_text(s_filter_label, label);
+    refresh();
+}
+
 static void on_row(lv_event_t *event)
 {
     s_selected = static_cast<int>(reinterpret_cast<intptr_t>(lv_event_get_user_data(event)));
@@ -210,13 +240,18 @@ void packet_screen_create()
     lv_label_set_text(s_status, "Stopped");
     lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 39);
 
-    lv_obj_t *start = make_button(s_screen, "START", 112);
-    lv_obj_align(start, LV_ALIGN_TOP_LEFT, 68, 59);
+    lv_obj_t *start = make_button(s_screen, "START", 100);
+    lv_obj_align(start, LV_ALIGN_TOP_LEFT, 34, 59);
     s_start_label = lv_obj_get_child(start, 0);
     lv_obj_add_event_cb(start, on_start, LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t *channel = make_button(s_screen, "HOP", 112);
-    lv_obj_align(channel, LV_ALIGN_TOP_RIGHT, -68, 59);
+    lv_obj_t *filter = make_button(s_screen, "ALL", 100);
+    lv_obj_align(filter, LV_ALIGN_TOP_LEFT, 155, 59);
+    s_filter_label = lv_obj_get_child(filter, 0);
+    lv_obj_add_event_cb(filter, on_filter, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *channel = make_button(s_screen, "HOP", 100);
+    lv_obj_align(channel, LV_ALIGN_TOP_LEFT, 276, 59);
     s_channel_label = lv_obj_get_child(channel, 0);
     lv_obj_add_event_cb(channel, on_channel, LV_EVENT_CLICKED, nullptr);
 
@@ -300,4 +335,3 @@ void packet_screen_show()
 
 void packet_screen_stop() { packet_capture_stop(); }
 bool packet_screen_is_active() { return lv_screen_active() == s_screen; }
-
