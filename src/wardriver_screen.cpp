@@ -141,7 +141,7 @@ static void wd_beacon_cb(const WifiBeacon *b) {
     xQueueSend(ap_queue, &raw, 0);
 }
 
-// ─── BLE scan-result consumer (BT task) ──────────────────────
+// ─── BLE scan-result consumer (main-loop dispatch) ───────────
 // The shared scan manager pre-filters to inquiry responses and handles the
 // controller lifecycle; we only need to act on each result.
 static void ble_gap_cb(esp_ble_gap_cb_param_t *param) {
@@ -181,10 +181,17 @@ static void ble_gap_cb(esp_ble_gap_cb_param_t *param) {
         pos += 1 + (int)seg_len;
     }
 
-    flock_check(raw.mac, raw.rssi, raw.ssid, 'L');
-    airtag_check(raw.mac, raw.rssi, res.ble_addr_type, res.ble_adv, total_len);
-    flipper_check(raw.mac, raw.rssi, res.ble_addr_type, res.ble_adv, total_len);
-    skimmer_check(raw.mac, raw.rssi, res.ble_addr_type, res.ble_adv, total_len);
+    // Wardriver keeps passive detection available even when a detector tile is
+    // off. If its standalone tile is registered, let that callback do the
+    // check once instead of parsing the same advertisement twice.
+    if (!flock_is_running())
+        flock_check(raw.mac, raw.rssi, raw.ssid, 'L');
+    if (!airtag_is_running())
+        airtag_check(raw.mac, raw.rssi, res.ble_addr_type, res.ble_adv, total_len);
+    if (!flipper_is_running())
+        flipper_check(raw.mac, raw.rssi, res.ble_addr_type, res.ble_adv, total_len);
+    if (!skimmer_is_running())
+        skimmer_check(raw.mac, raw.rssi, res.ble_addr_type, res.ble_adv, total_len);
     xQueueSend(ap_queue, &raw, 0);
 }
 
@@ -421,10 +428,8 @@ static void on_bt_toggle(lv_event_t *) {
 // ─── Button ────────────────────────────────────────────────────
 static void on_start_stop(lv_event_t *) {
     if (!is_running) {
-        // wifi_beacon_add() inside start_wardriving()
-        // can block the main loop for ~1 s. Flip the UI to STOP *before*
-        // we go into that blocking call (and force a flush) so the user
-        // sees instant feedback instead of staring at a stale START.
+        // Flip the UI to STOP before registering the asynchronous shared WiFi
+        // scanner so the running state is visible immediately.
         lv_obj_set_style_bg_color(start_btn, lv_color_make(0xCC, 0x00, 0x00), LV_PART_MAIN);
         lv_label_set_text(start_btn_label, "STOP");
         lv_obj_add_state(wifi_toggle_sw, LV_STATE_DISABLED);

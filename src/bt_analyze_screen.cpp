@@ -81,7 +81,7 @@ static lv_color_t bucket_colour(int b)
     return lv_color_make((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
 }
 
-// ---- BLE callback (runs on Bluedroid task) ---------------------------------
+// ---- BLE result callback (dispatched on the main loop) ---------------------
 
 static void scan_cb(esp_ble_gap_cb_param_t *param)
 {

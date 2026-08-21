@@ -2,6 +2,7 @@
 #include "pingsweep.h"
 #include "hostresolve.h"
 #include "portscan_screen.h"
+#include "wifi_credentials.h"
 #include <LilyGoLib.h>
 #include <WiFi.h>
 #include <string.h>
@@ -43,6 +44,10 @@ static int       s_net_count = 0;
 static int       s_pending   = -1;   // network index awaiting a password
 static uint32_t  s_connect_start = 0;
 static int       s_shown_dev = -1;   // device count last drawn into the list
+static char      s_connect_ssid[33] = {};
+static char      s_connect_password[64] = {};
+static bool      s_connect_used_saved = false;
+static int       s_ignore_next_click = -1;
 
 // ---- list rendering --------------------------------------------------------
 
@@ -85,6 +90,7 @@ static void placeholder(const char *txt)
 }
 
 static void on_net_clicked(lv_event_t *e);
+static void on_net_long_pressed(lv_event_t *e);
 
 static void show_networks()
 {
@@ -94,12 +100,18 @@ static void show_networks()
         lv_obj_t *card = make_card(true);
         lv_obj_add_event_cb(card, on_net_clicked, LV_EVENT_CLICKED,
                             (void *)(intptr_t)i);
+        bool saved = wifi_credentials_get(s_nets[i].ssid, nullptr, 0);
+        if (saved)
+            lv_obj_add_event_cb(card, on_net_long_pressed,
+                                LV_EVENT_LONG_PRESSED,
+                                (void *)(intptr_t)i);
         add_text(card, s_nets[i].ssid[0] ? s_nets[i].ssid : "(hidden)",
                  &lv_font_montserrat_20, lv_color_white());
-        char det[48];
-        snprintf(det, sizeof(det), "%d dBm   ch %d   %s",
+        char det[80];
+        snprintf(det, sizeof(det), "%d dBm   ch %d   %s%s",
                  (int)s_nets[i].rssi, s_nets[i].channel,
-                 s_nets[i].open ? "open" : "secured");
+                 s_nets[i].open ? "open" : "secured",
+                 saved ? "   SAVED (hold to forget)" : "");
         add_text(card, det, &lv_font_montserrat_14, lv_color_make(0x99, 0x99, 0x99));
     }
 }
@@ -177,6 +189,9 @@ static void show_devices()
                 show_ip_on_line2 ? ip : "", src_tag, d->rtt_ms);
         }
         add_text(card, det, &lv_font_montserrat_14, lv_color_make(0x99, 0x99, 0x99));
+        if (d->services[0])
+            add_text(card, d->services, &lv_font_montserrat_14,
+                     lv_color_make(0x66, 0xCC, 0xBB));
     }
     s_shown_dev = n;
 }
@@ -210,7 +225,9 @@ static void update_status()
         break;
     case WST_CONNECTED:
         if (pingsweep_is_running()) {
-            snprintf(buf, sizeof(buf), "Sweeping %d/%d - %d found",
+            char cidr[28];
+            pingsweep_network_cidr(cidr, sizeof(cidr));
+            snprintf(buf, sizeof(buf), "%s  %d/%d - %d found", cidr,
                      pingsweep_scanned(), pingsweep_total(),
                      pingsweep_device_count());
             col = lv_color_make(0xFF, 0xCC, 0x00);
@@ -243,6 +260,8 @@ static void update_status()
                                   hs.dns_server_ip        & 0xFF,
                                  hs.dns_sent, hs.dns_replies, hs.dns_named);
                     }
+                } else if (hs.pass == HRPASS_SERVICES) {
+                    snprintf(buf, sizeof(buf), "Discovering SSDP + DNS-SD services...");
                 } else {
                     snprintf(buf, sizeof(buf), "Resolving OUI vendors...");
                 }
@@ -251,10 +270,10 @@ static void update_status()
                 // Resolver just finished — show a breakdown so the user
                 // sees what each pass actually contributed.
                 snprintf(buf, sizeof(buf),
-                         "%d dev  mdns=%u nbns=%u dns=%u oui=%u",
+                         "%d dev names %u/%u/%u oui=%u svc=%u",
                          pingsweep_device_count(),
                          hs.mdns_named, hs.nbns_named,
-                         hs.dns_named, hs.oui_named);
+                         hs.dns_named, hs.oui_named, hs.service_replies);
                 col = lv_color_make(0x00, 0xCC, 0x66);
             } else {
                 snprintf(buf, sizeof(buf), "Sweep complete - %d devices",
@@ -325,8 +344,11 @@ static void exit_password_mode()
     lv_obj_clear_flag(list_box, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void begin_connect(const char *ssid, const char *pass)
+static void begin_connect(const char *ssid, const char *pass, bool used_saved)
 {
+    strlcpy(s_connect_ssid, ssid ? ssid : "", sizeof(s_connect_ssid));
+    strlcpy(s_connect_password, pass ? pass : "", sizeof(s_connect_password));
+    s_connect_used_saved = used_saved;
     WiFi.mode(WIFI_STA);
     if (pass && pass[0]) WiFi.begin(ssid, pass);
     else                 WiFi.begin(ssid);
@@ -338,22 +360,46 @@ static void on_net_clicked(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= s_net_count) return;
+    if (idx == s_ignore_next_click) {
+        s_ignore_next_click = -1;
+        return;
+    }
     s_pending = idx;
     if (s_nets[idx].open) {
-        begin_connect(s_nets[idx].ssid, nullptr);
+        begin_connect(s_nets[idx].ssid, nullptr, false);
     } else {
-        s_state = WST_PASSWORD;
-        enter_password_mode();
+        char password[64] = {};
+        if (wifi_credentials_get(s_nets[idx].ssid,
+                                 password, sizeof(password))) {
+            begin_connect(s_nets[idx].ssid, password, true);
+            memset(password, 0, sizeof(password));
+        } else {
+            s_state = WST_PASSWORD;
+            enter_password_mode();
+        }
     }
     update_status();
     update_buttons();
+}
+
+static void on_net_long_pressed(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_net_count) return;
+    s_ignore_next_click = idx;
+    if (wifi_credentials_forget(s_nets[idx].ssid)) {
+        lv_label_set_text(status_label, "Saved network forgotten");
+        lv_obj_set_style_text_color(status_label,
+                                    lv_color_make(0xFF, 0xAA, 0x33),
+                                    LV_PART_MAIN);
+    }
 }
 
 static void on_kb_event(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY && s_pending >= 0) {
-        begin_connect(s_nets[s_pending].ssid, lv_textarea_get_text(pw_ta));
+        begin_connect(s_nets[s_pending].ssid, lv_textarea_get_text(pw_ta), false);
     } else {
         s_state = WST_LIST;   // cancelled
     }
@@ -387,7 +433,8 @@ static void on_btn1(lv_event_t *)
 static void on_btn2(lv_event_t *)   // DISCONNECT
 {
     pingsweep_stop();
-    WiFi.disconnect(true);
+    WiFi.disconnect(true, false);
+    memset(s_connect_password, 0, sizeof(s_connect_password));
     s_state = (s_net_count > 0) ? WST_LIST : WST_IDLE;
     if (s_state == WST_LIST) show_networks();
     else { lv_obj_clean(list_box); placeholder("Tap SCAN to begin"); }
@@ -413,8 +460,28 @@ static void on_refresh(lv_timer_t *)
                 s_nets[i].open    = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
             }
             WiFi.scanDelete();
-            s_state = WST_LIST;
-            show_networks();
+            bool connecting_saved = false;
+            // Arduino returns scan results strongest-first. Reconnect to the
+            // strongest visible saved network instead of blindly retrying the
+            // most recently used AP for 15 seconds when it is out of range.
+            for (int i = 0; i < s_net_count; ++i) {
+                char password[64] = {};
+                if (s_nets[i].ssid[0] &&
+                    wifi_credentials_get(s_nets[i].ssid,
+                                         password, sizeof(password))) {
+                    s_pending = i;
+                    lv_obj_clean(list_box);
+                    placeholder("Connecting to saved network...");
+                    begin_connect(s_nets[i].ssid, password, true);
+                    memset(password, 0, sizeof(password));
+                    connecting_saved = true;
+                    break;
+                }
+            }
+            if (!connecting_saved) {
+                s_state = WST_LIST;
+                show_networks();
+            }
         } else if (n == WIFI_SCAN_FAILED) {
             s_state = WST_IDLE;
         }
@@ -422,13 +489,26 @@ static void on_refresh(lv_timer_t *)
     }
     case WST_CONNECTING:
         if (WiFi.status() == WL_CONNECTED) {
+            // Commit only after association succeeds. A mistyped password is
+            // never persisted, and a successful reconnect becomes most-recent.
+            wifi_credentials_save(s_connect_ssid, s_connect_password);
+            memset(s_connect_password, 0, sizeof(s_connect_password));
             s_state = WST_CONNECTED;
             s_shown_dev = -1;
             show_devices();
         } else if (millis() - s_connect_start > 15000) {
-            WiFi.disconnect(true);
-            s_state = WST_LIST;
-            show_networks();
+            WiFi.disconnect(true, false);
+            memset(s_connect_password, 0, sizeof(s_connect_password));
+            if (s_connect_used_saved && s_pending >= 0 &&
+                s_pending < s_net_count && wifi_screen_is_active()) {
+                // The AP may have changed its password. Prompt immediately;
+                // a successful retry replaces the stored credential.
+                s_state = WST_PASSWORD;
+                enter_password_mode();
+            } else {
+                s_state = WST_LIST;
+                show_networks();
+            }
         }
         break;
     case WST_CONNECTED:
@@ -572,12 +652,24 @@ void wifi_screen_show()
         s_shown_dev = -1;
         show_devices();
     } else if (s_net_count > 0) {
-        s_state = WST_LIST;
-        show_networks();
+        if (wifi_credentials_count() > 0) {
+            lv_obj_clean(list_box);
+            placeholder("Looking for saved networks...");
+            start_scan();
+        } else {
+            s_state = WST_LIST;
+            show_networks();
+        }
     } else {
-        s_state = WST_IDLE;
-        lv_obj_clean(list_box);
-        placeholder("Tap SCAN to begin");
+        if (wifi_credentials_count() > 0) {
+            lv_obj_clean(list_box);
+            placeholder("Looking for saved networks...");
+            start_scan();
+        } else {
+            s_state = WST_IDLE;
+            lv_obj_clean(list_box);
+            placeholder("Tap SCAN to begin");
+        }
     }
     update_status();
     update_buttons();

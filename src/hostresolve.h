@@ -26,7 +26,8 @@ enum HostResolvePass {
     HRPASS_NBNS = 2,   // NetBIOS Name Service (UDP/137 NBSTAT)
     HRPASS_DNS  = 3,
     HRPASS_OUI  = 4,
-    HRPASS_DONE = 5,
+    HRPASS_SERVICES = 5,
+    HRPASS_DONE = 6,
 };
 
 // Snapshot of the resolver's progress. Read via hostresolve_get_stats().
@@ -43,6 +44,7 @@ struct HostResolveStats {
     uint16_t dns_replies;
     uint16_t dns_named;
     uint16_t oui_named;
+    uint16_t service_replies;
     uint32_t dns_server_ip;    // host-order; 0 if no LAN DNS configured
     bool     mdns_bound_5353;  // did we manage to bind to port 5353?
 };

@@ -1,13 +1,17 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
-// ICMP ping sweep of the locally-connected /24 network. Runs in a background
+// ICMP ping sweep of the locally-connected subnet. Runs in a background
 // task so the UI stays live; discovered hosts are collected into a list and,
 // once the sweep finishes, written to /PingSweeps/ on the SD card.
 
-#define PINGSWEEP_MAX_DEVICES 254
+#define PINGSWEEP_MAX_TARGETS 254
+#define PINGSWEEP_MAX_DEVICES 64
 #define PINGSWEEP_NAME_MAX     64
+#define PINGSWEEP_EVIDENCE_MAX 48
+#define PINGSWEEP_SERVICES_MAX 80
 
 // Where did the name we display come from? Filled in by hostresolve after
 // the sweep completes. NAME_NONE means we never found one and the UI
@@ -27,9 +31,16 @@ struct PingDevice {
     bool     has_mac;
     char     name[PINGSWEEP_NAME_MAX];  // empty unless name_source != NONE
     uint8_t  name_source;               // PingNameSource
+    // Keep each piece of naming evidence instead of discarding weaker
+    // answers when the preferred display name is selected.
+    char mdns[PINGSWEEP_EVIDENCE_MAX];
+    char nbns[PINGSWEEP_EVIDENCE_MAX];
+    char ptr[PINGSWEEP_EVIDENCE_MAX];
+    char vendor[PINGSWEEP_EVIDENCE_MAX];
+    char services[PINGSWEEP_SERVICES_MAX];
 };
 
-void pingsweep_start();          // sweep the connected network's /24
+void pingsweep_start();          // sweep the connected subnet (bounded)
 void pingsweep_stop();           // abort an in-progress sweep
 bool pingsweep_is_running();
 void pingsweep_poll();           // writes results to SD once done; call from loop()
@@ -43,3 +54,6 @@ bool pingsweep_just_finished();  // true exactly once after a sweep completes
 // Writer used by hostresolve to drop a resolved name onto a discovered
 // host. No-op when idx is out of range or `src` is NAME_NONE.
 void pingsweep_set_name(int idx, const char *name, uint8_t src);
+void pingsweep_add_service_for_ip(uint32_t ip, const char *service);
+void pingsweep_network_cidr(char *out, size_t size);
+bool pingsweep_is_limited();

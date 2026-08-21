@@ -1,6 +1,7 @@
 #include "tools_screen.h"
 #include "airtag.h"
 #include "flipper.h"
+#include "flipper_remote_screen.h"
 #include "skimmer.h"
 #include "evil_twin.h"
 #include "flock.h"
@@ -13,23 +14,27 @@
 #include "wifi_screen.h"
 #include "stock_screen.h"
 #include "analyze_screen.h"
+#include "lora_analyze_screen.h"
 #include "about_screen.h"
 #include "rolling_code_screen.h"
 #include "packet_screen.h"
 #include "text_editor_screen.h"
 #include "theme.h"
 #include <LilyGoLib.h>
+#include <string.h>
 
 // Defined in main.cpp
 void clock_screen_show();
 void main_loop_request_lvgl_priority(int cycles);
 
 static lv_obj_t *tools_screen;
+static lv_obj_t *t_grid;
 static lv_obj_t *t_airtag;    // referenced by on_airtag_clicked for colour swap
 static lv_obj_t *t_flipper;   // referenced by on_flipper_clicked for colour swap
 static lv_obj_t *t_skimmer;   // referenced by on_skimmer_clicked for colour swap
 static lv_obj_t *t_eviltwin;  // referenced by on_eviltwin_clicked for colour swap
 static lv_obj_t *t_flock;     // referenced by on_flock_clicked for colour swap
+static lv_obj_t *t_flock_status;
 static lv_obj_t *t_about_disc;
 static lv_obj_t *t_about_info;
 
@@ -70,13 +75,8 @@ static void set_flipper_tile_running(bool running)
 
 static void on_flipper_clicked(lv_event_t *e)
 {
-    if (flipper_is_running()) {
-        flipper_stop();
-        set_flipper_tile_running(false);
-    } else {
-        bool ok = flipper_start();
-        set_flipper_tile_running(ok);   // stays gray if BT init failed
-    }
+    (void)e;
+    flipper_remote_screen_show();
 }
 
 static void set_skimmer_tile_running(bool running)
@@ -89,6 +89,8 @@ static void set_skimmer_tile_running(bool running)
 
 static void on_skimmer_clicked(lv_event_t *e)
 {
+    // Paint the tile state before a cold BLE controller startup begins.
+    main_loop_request_lvgl_priority(12);
     if (skimmer_is_running()) {
         skimmer_stop();
         set_skimmer_tile_running(false);
@@ -120,17 +122,33 @@ static void on_eviltwin_clicked(lv_event_t *e)
 static void refresh_flock_tile()
 {
     bool running = flock_is_running();
+    bool transitioning = flock_is_starting() || flock_is_stopping();
     lv_obj_set_style_bg_color(t_flock,
-        (flock_is_starting() || flock_is_stopping())
+        transitioning
                 ? lv_color_make(0x55, 0x44, 0x11)
                 : running ? theme_accent_dark()
                 : lv_color_make(0x11, 0x11, 0x11),
         LV_PART_MAIN);
+    if (t_flock_status) {
+        const char *status = flock_is_starting() ? "Starting..."
+                           : flock_is_stopping() ? "Stopping..."
+                           : flock_status_text();
+        lv_label_set_text(t_flock_status, status);
+        lv_obj_set_style_text_color(t_flock_status,
+            transitioning ? lv_color_make(0xFF, 0xCC, 0x55)
+            : running ? theme_accent_bright()
+            : !strcmp(status, "Start failed") ? lv_color_make(0xFF, 0x66, 0x66)
+            : lv_color_make(0x88, 0x88, 0x88),
+            LV_PART_MAIN);
+    }
 }
 
 static void on_tools_status_timer(lv_timer_t *)
 {
-    if (lv_screen_active() == tools_screen) refresh_flock_tile();
+    if (lv_screen_active() == tools_screen) {
+        refresh_flock_tile();
+        set_flipper_tile_running(flipper_is_running());
+    }
 }
 
 static void on_flock_clicked(lv_event_t *e)
@@ -151,17 +169,17 @@ static lv_obj_t *make_tile(lv_obj_t *parent, const char *label_text)
 {
     lv_obj_t *tile = lv_obj_create(parent);
     lv_obj_set_size(tile, 180, 180);
-    lv_obj_set_style_bg_color(tile, lv_color_make(0x11, 0x11, 0x11), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(tile, theme_panel(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tile, lv_color_make(0x44, 0x44, 0x44), LV_PART_MAIN);
+    lv_obj_set_style_border_color(tile, theme_border(), LV_PART_MAIN);
     lv_obj_set_style_border_width(tile, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(tile, 14, LV_PART_MAIN);
+    lv_obj_set_style_radius(tile, theme_corner_radius(), LV_PART_MAIN);
     lv_obj_set_style_pad_all(tile, 0, LV_PART_MAIN);
     lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *lbl = lv_label_create(tile);
-    lv_obj_set_style_text_color(lbl, lv_color_make(0xCC, 0xCC, 0xCC), LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, theme_text(), LV_PART_MAIN);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_label_set_text(lbl, label_text);
     lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, -12);
@@ -503,6 +521,44 @@ static void draw_flock_icon(lv_obj_t *tile)
     lv_obj_set_style_pad_all(rec, 0, LV_PART_MAIN);
     lv_obj_clear_flag(rec, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_align(rec, LV_ALIGN_TOP_RIGHT, -24, 38);
+
+    t_flock_status = lv_label_create(tile);
+    lv_obj_set_width(t_flock_status, 160);
+    lv_obj_set_style_text_align(t_flock_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(t_flock_status, lv_color_make(0x88, 0x88, 0x88), LV_PART_MAIN);
+    lv_obj_set_style_text_font(t_flock_status, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_label_set_text(t_flock_status, "Stopped");
+    lv_obj_align(t_flock_status, LV_ALIGN_TOP_MID, 0, 98);
+}
+
+// Dedicated sub-GHz spectrum tile: stacked heat-map rows over a frequency
+// baseline distinguish it from the three-radio Analyze tour.
+static void draw_spectrum_icon(lv_obj_t *tile)
+{
+    static const uint32_t rows[5] = {
+        0x102040, 0x184878, 0x18A8C8, 0x44CC66, 0xFFB020,
+    };
+    for (int y = 0; y < 5; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            lv_obj_t *cell = lv_obj_create(tile);
+            lv_obj_set_size(cell, 13, 11);
+            lv_obj_set_pos(cell, 31 + x * 15, 34 + y * 13);
+            uint32_t color = rows[(y + x * 3) % 5];
+            if (x == 5 && y < 2) color = 0xFF4433;
+            lv_obj_set_style_bg_color(cell,
+                lv_color_make((color >> 16) & 0xFF,
+                              (color >> 8) & 0xFF,
+                              color & 0xFF), LV_PART_MAIN);
+            lv_obj_set_style_border_width(cell, 0, LV_PART_MAIN);
+            lv_obj_set_style_pad_all(cell, 0, LV_PART_MAIN);
+            lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+        }
+    }
+    lv_obj_t *mhz = lv_label_create(tile);
+    lv_obj_set_style_text_color(mhz, lv_color_make(0xAA, 0xBB, 0xCC), LV_PART_MAIN);
+    lv_obj_set_style_text_font(mhz, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_label_set_text(mhz, "315  433  868  915");
+    lv_obj_align(mhz, LV_ALIGN_TOP_MID, 0, 104);
 }
 
 // Lower-left: microSD card — rounded body with a chamfered top-left corner and
@@ -1034,6 +1090,7 @@ void tools_screen_create()
     // 180px tile + the 12px column gap exceeds half the 384px inner width),
     // and the container scrolls vertically when future tiles overflow.
     lv_obj_t *grid = lv_obj_create(tools_screen);
+    t_grid = grid;
     lv_obj_set_size(grid, 400, 432);
     lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 52);
     lv_obj_set_style_bg_color(grid, lv_color_black(), LV_PART_MAIN);
@@ -1052,19 +1109,21 @@ void tools_screen_create()
 
     // Insertion order maps to row-major (grid wraps every 2 tiles):
     //   [WiFi]      [Analyze]
-    //   [Mouse]     [USB SD]
-    //   [Pager]     [TPMS]
-    //   [LoRa APRS] [Tesla CP]
-    //   [Stocks]    [AirTag]
-    //   [Flipper]   [Skimmers]
-    //   [Evil Twin] [Flock]
-    //   [Packets]    [Editor]
-    //   [Rolling RX] [About]
+    //   [Spectrum]  [Mouse]
+    //   [USB SD]    [Pager]
+    //   [TPMS]      [LoRa APRS]
+    //   [Tesla CP]  [Stocks]
+    //   [AirTag]    [Flipper]
+    //   [Skimmers]  [Evil Twin]
+    //   [Flock]     [Packets]
+    //   [Editor]    [Rolling RX]
+    //   [About]
     // The timepiece tiles (Alarm / Stopwatch / Timer / Calendar) used to live
     // at the bottom of this grid; they moved to the TIME screen (swipe up
     // from the clock face).
     lv_obj_t *t_wifi    = make_tile(grid, "WiFi");
     lv_obj_t *t_analyze = make_tile(grid, "Analyze");
+    lv_obj_t *t_spectrum= make_tile(grid, "Spectrum");
     lv_obj_t *t_mouse   = make_tile(grid, "Mouse");
     lv_obj_t *t_usbsd   = make_tile(grid, "USB SD");
     lv_obj_t *t_pager   = make_tile(grid, "Pager");
@@ -1084,6 +1143,7 @@ void tools_screen_create()
 
     draw_wifi_icon(t_wifi);
     draw_analyzer_icon(t_analyze);
+    draw_spectrum_icon(t_spectrum);
     draw_mouse_icon(t_mouse);
     draw_microsd_icon(t_usbsd);
     draw_pager_icon(t_pager);
@@ -1112,8 +1172,8 @@ void tools_screen_create()
     lv_obj_add_event_cb(t_airtag, on_airtag_clicked, LV_EVENT_CLICKED, NULL);
     set_airtag_tile_running(airtag_is_running());
 
-    // Flipper tile toggles the BLE Flipper Zero detector. Same dim-green
-    // running indication as AirTag.
+    // Flipper opens the paired RPC controller.  Its screen retains the
+    // detector switch; the tile remains green while passive detection runs.
     lv_obj_add_event_cb(t_flipper, on_flipper_clicked, LV_EVENT_CLICKED, NULL);
     set_flipper_tile_running(flipper_is_running());
 
@@ -1162,6 +1222,11 @@ void tools_screen_create()
     // Analyze tile opens the WiFi channel utilisation visualisation.
     lv_obj_add_event_cb(t_analyze, [](lv_event_t *) { analyze_screen_show(); }, LV_EVENT_CLICKED, NULL);
 
+    // Direct entry to the receive-only SX1262 waterfall / swept RSSI screen.
+    lv_obj_add_event_cb(t_spectrum,
+        [](lv_event_t *) { lora_analyze_screen_show_direct(); },
+        LV_EVENT_CLICKED, NULL);
+
     lv_obj_add_event_cb(t_about, [](lv_event_t *) { about_screen_show(); }, LV_EVENT_CLICKED, NULL);
 
     // lv_obj_create() creates objects with LV_OBJ_FLAG_CLICKABLE set by
@@ -1185,6 +1250,22 @@ void tools_screen_create()
 
 void tools_screen_show()
 {
+    lv_obj_set_style_bg_color(tools_screen, theme_background(), LV_PART_MAIN);
+    if (t_grid) {
+        const uint32_t count = lv_obj_get_child_count(t_grid);
+        for (uint32_t i = 0; i < count; ++i) {
+            lv_obj_t *tile = lv_obj_get_child(t_grid, i);
+            lv_obj_set_style_bg_color(tile, theme_panel(), LV_PART_MAIN);
+            lv_obj_set_style_border_color(tile, theme_border(), LV_PART_MAIN);
+            lv_obj_set_style_radius(tile, theme_corner_radius(), LV_PART_MAIN);
+            const uint32_t children = lv_obj_get_child_count(tile);
+            if (children > 0) {
+                lv_obj_t *label = lv_obj_get_child(tile, children - 1);
+                if (lv_obj_check_type(label, &lv_label_class))
+                    lv_obj_set_style_text_color(label, theme_text(), LV_PART_MAIN);
+            }
+        }
+    }
     // Refresh running-state tiles so changing the accent theme in Settings is
     // reflected the next time Tools opens.
     set_airtag_tile_running(airtag_is_running());
